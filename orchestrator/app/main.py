@@ -100,6 +100,8 @@ class SOCState(TypedDict, total=False):
     decision: str                               # logged | pending_fido2 | ...
     test: bool                                  # synthetic run from the dashboard test lab
     test_quiet: bool                            # test escalation: no Discord alert, auto-withdrawn
+    test_run: str                               # test-lab run id, for the live view
+    test_batch: int                             # which batch of that run (1-based)
     trace: Annotated[list[dict[str, Any]], operator.add]   # one entry per agent, for the dashboard
 
 
@@ -997,14 +999,20 @@ def _traced(agent: str, fn, describe):
     """Wrap a node so every run leaves a trace entry and updates the live agent state."""
     async def node(state: SOCState) -> dict[str, Any]:
         activity.agent_busy(agent, state["endpoint_id"], bool(state.get("test")))
-        t0 = time.perf_counter()
+        run_id, batch = state.get("test_run"), state.get("test_batch")
         try:
+            if run_id:   # dashboard test: announce the step and pause so a human can follow along
+                _live(run_id, "agent_start", agent=agent, batch=batch)
+                await asyncio.sleep(TEST_STEP_DELAY)
+            t0 = time.perf_counter()
             out = await fn(state)
+            ms = round((time.perf_counter() - t0) * 1000, 1)   # real work only, not the pause
         finally:
             activity.agent_idle(agent)
         merged = {**state, **out}
-        entry = {"agent": agent, "ms": round((time.perf_counter() - t0) * 1000, 1),
-                 **describe(merged if agent == "warden" else state, out)}
+        entry = {"agent": agent, "ms": ms, **describe(merged if agent == "warden" else state, out)}
+        if run_id:
+            _live(run_id, "agent_done", batch=batch, **entry)
         return {**out, "trace": [entry]}
     return node
 
@@ -1268,10 +1276,13 @@ async def require_shipper_token(x_soc_token: str | None = Header(default=None)) 
 
 
 async def run_pipeline(endpoint_id: str, raw: list[dict[str, Any]], test: bool = False,
-                       quiet: bool = False) -> SOCState:
+                       quiet: bool = False, run_id: str | None = None, batch: int = 0) -> SOCState:
     """Run the four agents over one batch and record the run for the dashboard."""
-    final: SOCState = await soc_graph.ainvoke(
-        {"endpoint_id": endpoint_id, "raw_events": raw, "test": test, "test_quiet": quiet, "trace": []})
+    initial: dict[str, Any] = {"endpoint_id": endpoint_id, "raw_events": raw, "test": test,
+                               "test_quiet": quiet, "trace": []}
+    if run_id:
+        initial.update(test_run=run_id, test_batch=batch)
+    final: SOCState = await soc_graph.ainvoke(initial)
     prefix = f"{endpoint_id}|"
     notes = final.get("enrichment_notes") or []
     activity.record(
@@ -1459,6 +1470,17 @@ MAX_TEST_RUNS = 30
 TEST_LOCK = asyncio.Lock()
 
 
+TEST_STEP_DELAY = 0.9       # pause before each agent in a test run, so the live view is followable
+TEST_SESSION: dict[str, Any] = {}   # progress of the current "run" request (for "test 3 of 10")
+
+
+def _live(run_id: str, kind: str, **data: Any) -> None:
+    """Append one step to a test run's live feed (shown in the dashboard's live window)."""
+    run = TEST_RUNS.get(run_id)
+    if run is not None and len(run.live) < 300:
+        run.live.append({"seq": len(run.live), "t": round(time.time(), 3), "kind": kind, **data})
+
+
 def _test_followup(challenge_id: str, stage: str, detail: str = "") -> None:
     """Advance the passkey/enforcer stage of an escalating test run."""
     for run in TEST_RUNS.values():
@@ -1466,6 +1488,7 @@ def _test_followup(challenge_id: str, stage: str, detail: str = "") -> None:
         if f and f.get("challenge_id") == challenge_id:
             f["stage"], f["detail"], f["updated_at"] = stage, detail[:300], time.time()
             f.setdefault("history", []).append({"stage": stage, "at": time.time()})
+            _live(run.id, "followup", stage=stage, detail=detail[:300])
 
 
 async def _simulate_test_enforcer(signed: dict[str, Any]) -> None:
@@ -1788,36 +1811,55 @@ class TestRunRequest(BaseModel):
 
 async def _run_scenario(sc: testlab.Scenario) -> testlab.TestRun:
     run = testlab.TestRun(id=secrets.token_urlsafe(6), scenario=sc.id, name=sc.name, icon=sc.icon,
-                          started_at=time.time())
+                          started_at=time.time(), tagline=sc.tagline, escalates=sc.escalates)
     TEST_RUNS[run.id] = run
     while len(TEST_RUNS) > MAX_TEST_RUNS:
         TEST_RUNS.pop(next(iter(TEST_RUNS)))
+    TEST_SESSION["run_id"] = run.id
     try:
         finals = []
-        for batch in sc.batches():
+        batches = sc.batches()
+        _live(run.id, "start", tagline=sc.tagline, expected=sc.expected, batches=len(batches),
+              agents=list(sc.agents))
+        for i, batch in enumerate(batches, 1):
             raw = [TelemetryEvent.model_validate(e).model_dump(mode="json") for e in batch]
-            final = await run_pipeline(testlab.TEST_ENDPOINT, raw, test=True, quiet=not sc.escalates)
+            _live(run.id, "attack", batch=i, of=len(batches), events=[{
+                "process": e["process_name"], "path": e.get("exe_path"), "user": e.get("user"),
+                "dst": f"{e.get('dst_ip')}:{e.get('dst_port')}", "cmdline": (e.get("cmdline") or "")[:200]}
+                for e in raw])
+            await asyncio.sleep(TEST_STEP_DELAY)
+            final = await run_pipeline(testlab.TEST_ENDPOINT, raw, test=True, quiet=not sc.escalates,
+                                       run_id=run.id, batch=i)
             finals.append(final)
             run.traces.append(final.get("trace") or [])
             run.scores.append(final.get("threat_score", 0))
+            _live(run.id, "batch_done", batch=i, score=final.get("threat_score", 0),
+                  decision=final.get("decision"), target_ip=final.get("target_ip"))
         run.checks = sc.checks(finals, settings.warden_threat_threshold,
                                settings.discord_webhook_url is not None)
         if not sc.escalates:   # quiet escalations only prove the Warden would pause; withdraw them
+            withdrawn = 0
             async with PENDING_LOCK:
                 for f in finals:
                     for cid in f.get("challenge_ids") or []:
-                        PENDING.pop(cid, None)
+                        withdrawn += PENDING.pop(cid, None) is not None
+            if withdrawn:
+                _live(run.id, "withdrawn", count=withdrawn)
         cids = finals[-1].get("challenge_ids") or []
         if sc.escalates and cids:
             run.followup = {"challenge_id": cids[0], "stage": "awaiting_passkey", "updated_at": time.time(),
                             "detail": "approve on your Pixel to test the passkey → signed order → enforcer path",
                             "expires_at": time.time() + settings.warden_approval_timeout_seconds,
                             "history": [{"stage": "awaiting_passkey", "at": time.time()}]}
+            _live(run.id, "followup", stage="awaiting_passkey", detail="waiting for your passkey")
         run.status = "passed" if all(c["ok"] is not False for c in run.checks) else "failed"
     except Exception as exc:
         log.exception("testlab: scenario %s crashed", sc.id)
         run.status, run.error = "error", f"{type(exc).__name__}: {str(exc)[:200]}"
     run.finished_at = time.time()
+    _live(run.id, "checks", status=run.status, error=run.error,
+          passed=sum(c["ok"] is True for c in run.checks),
+          ran=sum(c["ok"] is not None for c in run.checks), total=len(run.checks))
     passed = sum(c["ok"] is True for c in run.checks)
     log.info("testlab: %s %s (%d/%d checks)", sc.id, run.status.upper(), passed, len(run.checks))
     activity.record("test_run", scenario=sc.id, name=sc.name, status=run.status, passed=passed,
@@ -1863,10 +1905,28 @@ def _test_summary_embed(runs: list[testlab.TestRun]) -> dict[str, Any]:
 
 async def _run_tests(ids: list[str]) -> None:
     async with TEST_LOCK:
-        runs = [await _run_scenario(testlab.SCENARIOS[sid]) for sid in ids]
+        runs = []
+        for i, sid in enumerate(ids, 1):
+            TEST_SESSION.update(index=i, total=len(ids), started_at=time.time())
+            runs.append(await _run_scenario(testlab.SCENARIOS[sid]))
         sent = await _post_discord({"embeds": [_test_summary_embed(runs)]}, "test lab results")
         for r in runs:
             r.discord = sent
+
+
+@app.get("/dashboard/api/tests/live", dependencies=[Depends(require_dashboard)])
+async def dashboard_test_live(run: str | None = Query(default=None, pattern=r"^[A-Za-z0-9_-]{1,16}$")) -> Response:
+    """The live window's feed: one test run's step-by-step events. Cheap enough to poll fast."""
+    r = TEST_RUNS.get(run) if run else TEST_RUNS.get(TEST_SESSION.get("run_id", ""))
+    body = {
+        "now": time.time(),
+        "running": TEST_LOCK.locked(),
+        "session": {k: TEST_SESSION.get(k) for k in ("index", "total")},
+        "threshold": settings.warden_threat_threshold,
+        "run": r.as_dict() if r else None,
+    }
+    return Response(json.dumps(body, default=str), media_type="application/json",
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.post("/dashboard/api/tests/run", dependencies=[Depends(_dashboard_post_guard), Depends(require_dashboard)])

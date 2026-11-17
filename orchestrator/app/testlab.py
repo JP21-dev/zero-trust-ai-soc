@@ -357,6 +357,9 @@ class TestRun:
     error: str | None = None
     followup: dict[str, Any] | None = None   # passkey/enforcer stage for escalating scenarios
     discord: bool | None = None              # result summary posted to Discord? (None = not yet)
+    tagline: str = ""
+    escalates: bool = False
+    live: list[dict[str, Any]] = field(default_factory=list)   # step-by-step events for the live view
 
     def as_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)

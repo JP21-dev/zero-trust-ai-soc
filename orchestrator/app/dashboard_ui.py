@@ -125,6 +125,21 @@ DASHBOARD_HTML = """<!doctype html>
   </div>
 </main>
 <div id="tip" class="tip" role="tooltip" hidden></div>
+<aside id="live" class="live" hidden aria-label="Live test view">
+  <div class="live-head">
+    <span class="live-dot" id="live-dot" aria-hidden="true"></span>
+    <span id="live-title" class="live-title">Live test</span>
+    <span id="live-progress" class="live-prog"></span>
+    <button id="live-min" class="icon-btn" aria-label="Minimize live view" title="Minimize">–</button>
+    <button id="live-close" class="icon-btn" aria-label="Close live view" title="Close">×</button>
+  </div>
+  <div id="live-path" class="live-path" aria-label="Path through the agents"></div>
+  <div id="live-body" class="live-body">
+    <div id="live-attack" class="live-attack"></div>
+    <ol id="live-log" class="live-log" aria-live="polite"></ol>
+  </div>
+  <div id="live-foot" class="live-foot"></div>
+</aside>
 </body></html>
 """
 
@@ -395,6 +410,65 @@ tr:last-child td{border-bottom:0}
 .foot{margin-top:2rem;color:var(--muted);font-size:.8rem;text-align:center}
 @media (max-width:600px){main{padding:1rem}.top{position:static;padding:.6rem 1rem}.headline{order:3;flex-basis:100%}
 .nav{top:0;flex-wrap:nowrap;overflow-x:auto;justify-content:flex-start}html{scroll-padding-top:60px}}
+/* live test window */
+.live{position:fixed;right:20px;bottom:20px;z-index:40;width:min(460px,calc(100vw - 32px));max-height:min(74vh,680px);
+display:flex;flex-direction:column;border-radius:16px;overflow:hidden;
+background:linear-gradient(180deg,#1e1a29,#15131b);border:1px solid rgba(167,139,250,.45);
+box-shadow:0 0 0 1px rgba(139,92,246,.15),0 18px 50px rgba(0,0,0,.55),0 0 40px rgba(139,92,246,.18)}
+.live-head{display:flex;align-items:center;gap:.5rem;padding:.65rem .75rem .65rem .9rem;border-bottom:1px solid var(--line);
+background:rgba(139,92,246,.10)}
+.live-dot{width:.6rem;height:.6rem;border-radius:50%;background:var(--muted);flex:none}
+.live-dot.on{background:var(--purple2);animation:pulse 1.4s ease-out infinite}
+.live-dot.stop{background:var(--critical)}.live-dot.ok{background:var(--good)}
+.live-title{font-weight:700;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.live-prog{font-size:.75rem;color:var(--text2);white-space:nowrap}
+.icon-btn{padding:.15rem .5rem;font-size:1rem;line-height:1;background:transparent;border-color:transparent;color:var(--text2)}
+.icon-btn:hover{background:var(--surface2);border-color:var(--line2)}
+.live.min .live-body,.live.min .live-path,.live.min .live-foot{display:none}
+.live-body{display:flex;flex-direction:column;gap:.6rem;padding:.7rem .9rem .8rem;overflow:auto;min-height:0;flex:1}
+.live-path{display:flex;align-items:flex-start;gap:0;overflow-x:auto;padding:.7rem .6rem .55rem;flex:none;
+border-bottom:1px solid var(--line);background:rgba(13,12,17,.35)}
+.pnode{display:flex;flex-direction:column;align-items:center;gap:.25rem;min-width:3.6rem;flex:1;position:relative}
+.pnode:not(:last-child)::after{content:"";position:absolute;top:1rem;left:calc(50% + 1.05rem);right:calc(-50% + 1.05rem);
+height:2px;background:var(--line2)}
+.pnode.done:not(:last-child)::after,.pnode.warn:not(:last-child)::after{background:var(--purple)}
+.pnode .pic{display:grid;place-items:center;width:2rem;height:2rem;border-radius:50%;font-size:.95rem;
+background:var(--surface);border:2px solid var(--line2);transition:all .25s}
+.pnode .plab{font-size:.64rem;color:var(--muted);text-align:center;line-height:1.15}
+.pnode.active .pic{border-color:var(--purple2);background:var(--purple-wash);animation:pulse 1.2s ease-out infinite}
+.pnode.active .plab{color:var(--purple-ink);font-weight:650}
+.pnode.done .pic{border-color:var(--purple);background:rgba(139,92,246,.28)}
+.pnode.done .plab,.pnode.warn .plab{color:var(--text2)}
+.pnode.warn .pic{border-color:var(--warning);background:rgba(250,178,25,.14)}
+.pnode.alert .pic{border-color:var(--critical);background:rgba(208,59,59,.22)}
+.pnode.alert .plab,.pnode.fail .plab{color:var(--critical-ink);font-weight:650}
+.pnode.fail .pic{border-color:var(--critical);background:rgba(208,59,59,.22)}
+.pnode.skipped .pic{border-style:dashed;opacity:.45}
+.pnode.skipped .plab{opacity:.6}
+.live-attack{border:1px solid var(--line);border-radius:10px;background:var(--bg);padding:.55rem .65rem;font-size:.8rem}
+.live-attack .lbl{color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;font-weight:650;margin-bottom:.25rem}
+.live-attack .ev{display:flex;gap:.4rem;align-items:baseline;flex-wrap:wrap;padding:.15rem 0}
+.live-attack .ev code{color:var(--critical-ink)}
+.live-attack .ev .arrow{color:var(--muted)}
+.live-attack .cmd{display:block;color:var(--muted);font-size:.72rem;overflow-wrap:anywhere;margin:.05rem 0 .2rem}
+.live-log{list-style:none;margin:0;padding:0;display:grid;gap:.35rem}
+.live-log li{display:grid;grid-template-columns:1.5rem 1fr;gap:.45rem;font-size:.82rem;line-height:1.4;
+padding:.4rem .5rem;border-radius:9px;background:var(--surface);border:1px solid var(--line);animation:slidein .3s ease-out}
+@keyframes slidein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.live-log li .ic{text-align:center}
+.live-log li .ms{color:var(--muted);font-size:.7rem;margin-left:.3rem}
+.live-log li.working{border-color:var(--purple);background:var(--purple-wash)}
+.live-log li.working .ic{animation:pulse 1.2s ease-out infinite;border-radius:50%}
+.live-log li.warn{border-color:rgba(250,178,25,.5)}
+.live-log li.crit,.live-log li.stop{border-color:var(--critical);background:rgba(208,59,59,.12)}
+.live-log li.good{border-color:rgba(12,163,12,.6);background:rgba(12,163,12,.10)}
+.live-log li.lstep{background:transparent;border-style:dashed;color:var(--text2)}
+.live-log li b{font-weight:650}
+.live-foot{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;flex:none;padding:.6rem .9rem;
+border-top:1px solid var(--line);background:rgba(13,12,17,.35)}
+.live-foot:empty{display:none}
+.live-foot .muted{font-size:.78rem}
+@media (max-width:600px){.live{right:8px;left:8px;bottom:8px;width:auto;max-height:62vh}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}html{scroll-behavior:auto}}
 """
 
@@ -745,7 +819,7 @@ function renderDevices(d) {
 let testBusy = false;
 async function runTest(id) {
   testBusy = true; renderTests(last); $("lab-msg").textContent = "";
-  try { await api("/dashboard/api/tests/run", { scenario: id }); }
+  try { await api("/dashboard/api/tests/run", { scenario: id }); live.dismissed = false; openLive(); }
   catch (e) { $("lab-msg").textContent = "Couldn't start: " + e.message; }
   finally { testBusy = false; setTimeout(refresh, 400); }
 }
@@ -1017,6 +1091,161 @@ function renderSystem(d) {
     : [el("li", { class: "empty-note", text: "None enrolled." })]));
 }
 
+// ---------- live test window ----------
+const live = { open: false, timer: null, dismissed: false, lastSeq: -1, data: null, stick: true };
+const PATH = [["endpoint", "💻", "Endpoint"], ["gatekeeper", "🚪", "Gatekeeper"], ["detective", "🔎", "Detective"],
+  ["strategist", "🧠", "Strategist"], ["warden", "⚖️", "Warden"], ["passkey", "📱", "Your passkey"], ["enforcer", "🧱", "Enforcer"]];
+const FOLLOW = {
+  awaiting_passkey: ["📱", "", "<b>Waiting for your passkey.</b> The attack is frozen until you approve or deny it, below or from the 🧪 TEST alert on your phone."],
+  approved: ["✅", "good", "<b>Approved with your passkey.</b> The Hub signed a one-time execution order for exactly this block."],
+  picked_up: ["📥", "", "<b>The enforcer picked up the signed order</b> and is checking its signature."],
+  enforced: ["🧱", "good", "<b>Signature verified, block applied.</b> (Simulated: test IPs only, no real firewall changed.)"],
+  denied: ["⛔", "good", "<b>Denied.</b> The attack never ran: nothing executes without your approval."],
+  expired: ["⌛", "good", "<b>No approval in time, so it was auto-denied.</b> Nothing ran: the Warden fails safe."],
+  rejected: ["❌", "crit", "<b>The approval was rejected:</b> "],
+  enforce_failed: ["❌", "crit", "<b>The enforcer refused the order:</b> "],
+  order_expired: ["⚠️", "crit", "<b>No enforcer picked up the order in time.</b> Nothing was blocked."],
+};
+// Text from the server is set with textContent; only these fixed strings use <b>.
+function richText(node, html, extra) {
+  const parts = html.split(/(<b>|<\/b>)/); let bold = false;
+  for (const p of parts) {
+    if (p === "<b>") bold = true; else if (p === "</b>") bold = false;
+    else if (p) node.append(bold ? el("b", { text: p }) : document.createTextNode(p));
+  }
+  if (extra) node.append(document.createTextNode(extra));
+  return node;
+}
+function openLive() {
+  if (!live.open) live.lastSeq = -1;
+  live.open = true; $("live").hidden = false; $("live").classList.remove("min");
+  pollLive();
+}
+function closeLive() {   // stays closed until you start another test yourself
+  live.open = false; live.dismissed = true; $("live").hidden = true; clearTimeout(live.timer);
+}
+async function pollLive() {
+  clearTimeout(live.timer);
+  if (!live.open) return;
+  let d = null;
+  try { d = await api("/dashboard/api/tests/live"); } catch (_) {}
+  if (d) { live.data = d; renderLive(d); }
+  const f = d && d.run && d.run.followup;
+  const busy = d && (d.running || (f && ["awaiting_passkey", "approved", "picked_up"].includes(f.stage)));
+  live.timer = setTimeout(pollLive, busy ? 600 : 3000);
+}
+function nodeStates(run) {
+  const ev = run.live || [];
+  const batch = Math.max(1, ...ev.filter((e) => e.batch).map((e) => e.batch));
+  const st = {};
+  if (ev.some((e) => e.kind === "attack")) st.endpoint = "done";
+  for (const e of ev.filter((x) => x.batch === batch)) {
+    if (e.kind === "agent_start" && !st[e.agent]) st[e.agent] = "active";
+    if (e.kind === "agent_done") {
+      if (e.agent === "pipeline") { ["detective", "strategist", "warden"].forEach((a) => (st[a] = "skipped")); continue; }
+      st[e.agent] = e.status === "crit" ? "alert" : e.status === "ok" ? "done" : "warn";
+    }
+  }
+  if (run.escalates) {
+    const stage = run.followup ? run.followup.stage : null;
+    const order = ["awaiting_passkey", "approved", "picked_up", "enforced"];
+    const i = order.indexOf(stage);
+    if (stage === "awaiting_passkey") st.passkey = "active";
+    else if (i > 0) { st.passkey = "done"; st.enforcer = stage === "enforced" ? "done" : "active"; }
+    else if (["denied", "expired", "rejected"].includes(stage)) { st.passkey = stage === "rejected" ? "fail" : "done"; st.enforcer = "skipped"; }
+    else if (["enforce_failed", "order_expired"].includes(stage)) { st.passkey = "done"; st.enforcer = "fail"; }
+  }
+  return st;
+}
+function renderLive(d) {
+  const run = d.run;
+  if (!run) { $("live-title").textContent = "Live test"; $("live-log").replaceChildren(el("li", null, el("span", { class: "ic", text: "…" }), "Starting…")); return; }
+  const thr = d.threshold;
+  $("live-title").textContent = run.icon + " " + run.name;
+  $("live-progress").textContent = d.running && d.session && d.session.total > 1 ? "Test " + d.session.index + " of " + d.session.total : "";
+  const f = run.followup;
+  const active = run.status === "running" || (f && ["awaiting_passkey", "approved", "picked_up"].includes(f.stage));
+  const bad = run.status !== "passed" || (f && ["rejected", "enforce_failed", "order_expired"].includes(f.stage));
+  $("live-dot").className = "live-dot " + (active ? "on" : bad ? "stop" : "ok");
+
+  // path strip
+  const st = nodeStates(run);
+  const path = PATH.filter(([k]) => run.escalates || !["passkey", "enforcer"].includes(k));
+  $("live-path").replaceChildren(...path.map(([k, ic, lab]) => el("div", { class: "pnode " + (st[k] || "") },
+    el("span", { class: "pic", "aria-hidden": "true", text: ic }), el("span", { class: "plab", text: lab }))));
+
+  // the attack being sent
+  const atk = [...(run.live || [])].reverse().find((e) => e.kind === "attack");
+  $("live-attack").replaceChildren(...(atk ? [
+    el("div", { class: "lbl", text: "The attack" + (atk.of > 1 ? " · batch " + atk.batch + " of " + atk.of : "") }),
+    el("div", { class: "muted small", text: run.tagline }),
+    ...atk.events.map((e) => el("div", null,
+      el("div", { class: "ev" }, el("code", { text: e.process }), el("span", { class: "arrow", text: "→" }), el("code", { text: e.dst }),
+        e.user && /root|admin/i.test(e.user) ? el("span", { class: "tag crit", text: "user " + e.user }) : null),
+      e.path ? el("span", { class: "cmd mono", text: e.path }) : null,
+      e.cmdline && e.cmdline !== e.path ? el("span", { class: "cmd mono", text: "› " + e.cmdline }) : null))] : []));
+
+  // step log
+  const done = new Set((run.live || []).filter((e) => e.kind === "agent_done").map((e) => e.agent + "|" + e.batch));
+  const items = [];
+  for (const e of run.live || []) {
+    if (e.kind === "start") items.push(["▶", "lstep", "Test started. Expected: " + e.expected]);
+    else if (e.kind === "attack") items.push(["💻", "lstep", (e.of > 1 ? "Batch " + e.batch + ": the" : "The") + " test endpoint sends "
+      + e.events.length + " connection" + (e.events.length === 1 ? "" : "s") + " to the Hub."]);
+    else if (e.kind === "agent_start" && !done.has(e.agent + "|" + e.batch))
+      items.push([(AGENTS[e.agent] || { icon: "•" }).icon, "working", (AGENTS[e.agent] || { name: "Pipeline" }).name + " is analyzing…"]);
+    else if (e.kind === "agent_done") {
+      const a = AGENTS[e.agent] || { icon: "✓", name: "Pipeline" };
+      const li = el("li", { class: e.status === "crit" ? "crit" : e.status === "warn" || e.status === "alert" ? "warn" : "" },
+        el("span", { class: "ic", "aria-hidden": "true", text: a.icon }),
+        el("span", null, el("b", { text: a.name + ": " }), e.summary, el("span", { class: "ms", text: e.ms + " ms" })));
+      items.push(li);
+    } else if (e.kind === "batch_done") {
+      const dec = String(e.decision || "");
+      if (dec.startsWith("pending")) items.push(["🛑", "stop", "<b>Attack stopped.</b> Score " + e.score + " ≥ " + thr
+        + ": the Warden paused it before anything ran" + (e.target_ip ? " and proposed blocking " + e.target_ip : "") + "."]);
+      else if (dec === "already_pending") items.push(["🔁", "good", "<b>Same threat again, no second alert.</b> One approval is already waiting for it."]);
+      else if (dec === "all_events_known_safe") items.push(["✅", "good", "<b>Nothing to stop:</b> every connection was a known-safe app."]);
+      else items.push(["📝", e.score >= 50 ? "warn" : "good", "<b>Logged, not blocked:</b> score " + e.score + " is below " + thr
+        + (e.score >= 50 ? ", but it's too suspicious to learn as normal." : ".")]);
+    } else if (e.kind === "withdrawn") items.push(["🧹", "lstep", "Test cleanup: the paused approval was withdrawn (only the Full attack chain test asks for your passkey)."]);
+    else if (e.kind === "followup" && FOLLOW[e.stage]) {
+      const [ic, cls, txt] = FOLLOW[e.stage];
+      items.push([ic, cls, txt, ["rejected", "enforce_failed"].includes(e.stage) ? e.detail : ""]);
+    } else if (e.kind === "checks") items.push([e.status === "passed" ? "🏁" : "❗", e.status === "passed" ? "good" : "crit",
+      e.status === "error" ? "<b>Test error:</b> " : "<b>Automated checks " + (e.status === "passed" ? "passed" : "FAILED") + "</b>: "
+        + e.passed + " of " + e.ran + " checks" + (e.total > e.ran ? " (" + (e.total - e.ran) + " skipped)" : "") + ".", e.error || ""]);
+  }
+  const log = $("live-log"), body = $("live-body");
+  const seq = (run.live || []).length;
+  log.replaceChildren(...items.map((it) => {
+    if (it instanceof Node) return it;
+    const li = el("li", { class: it[1] }, el("span", { class: "ic", "aria-hidden": "true", text: it[0] }));
+    li.append(richText(el("span"), it[2], it[3]));
+    return li;
+  }));
+  const follow = seq !== live.lastSeq && (live.stick || live.lastSeq < 0);
+  live.lastSeq = seq;
+
+  // footer: act on the attack
+  const foot = [];
+  if (f && f.stage === "awaiting_passkey") {
+    const left = Math.max(0, Math.round((f.expires_at || 0) - d.now));
+    foot.push(el("a", { class: "btn primary", href: "/warden/approve/" + encodeURIComponent(f.challenge_id), text: "Approve with passkey" }),
+      el("button", { text: "Deny (stop it)", onclick: (ev) => deny(f.challenge_id, ev.currentTarget).then(pollLive) }),
+      el("span", { class: "muted", text: "⏱ " + Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0") }));
+  } else if (!d.running) {
+    foot.push(el("a", { class: "btn", href: "#testlab", text: "See all results" }));
+  }
+  $("live-foot").replaceChildren(...foot);
+  // Follow new steps (after the footer has settled, since it changes the log's height),
+  // unless you've scrolled up to read something.
+  if (follow) requestAnimationFrame(() => {
+    live.autoScroll = true; body.scrollTop = body.scrollHeight; live.stick = true;
+    requestAnimationFrame(() => { live.autoScroll = false; });
+  });
+}
+
 // ---------- loop ----------
 let last = null, timer = null, ticker = null;
 function render(d) {
@@ -1024,6 +1253,7 @@ function render(d) {
   renderHeader(d); renderPending(d); renderAgents(d); renderFeed(d); renderDevices(d); renderTests(d);
   renderKpis(d); volumeChart(d.series); scoreChart(d.series, d.health.threshold);
   renderTimeline(d); renderBlocks(d); renderNewConns(d); renderSystem(d);
+  if (d.tests.running && !live.open && !live.dismissed) openLive();   // e.g. a test started from another tab
   $("foot").textContent = "Updated " + clockS(d.now) + " · live (every 3 s) · session ends " + clock(d.session.expires_at);
 }
 async function refresh() {
@@ -1046,6 +1276,17 @@ document.addEventListener("DOMContentLoaded", () => {
   $("signin").addEventListener("click", signIn);
   $("logout").addEventListener("click", signOut);
   $("run-all").addEventListener("click", () => runTest("all"));
+  $("live-close").addEventListener("click", closeLive);
+  $("live-body").addEventListener("scroll", () => {
+    if (live.autoScroll) return;   // ignore our own scrolling; only you can unstick it
+    const b = $("live-body");
+    live.stick = b.scrollHeight - b.scrollTop - b.clientHeight < 40;
+  });
+  $("live-min").addEventListener("click", () => {
+    const min = $("live").classList.toggle("min");
+    $("live-min").textContent = min ? "▢" : "–";
+    $("live-min").setAttribute("aria-label", min ? "Expand live view" : "Minimize live view");
+  });
   document.addEventListener("visibilitychange", () => { if (!document.hidden && timer) refresh(); });
   let rz = null;
   addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => last && render(last), 150); });

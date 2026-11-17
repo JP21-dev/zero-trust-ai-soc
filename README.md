@@ -62,7 +62,9 @@ through the real pipeline and posts pass/fail to Discord.
   vector DB has no network egress at all. Containers are read-only, non-root, no capabilities.
 - **Dashboard + test lab.** 10 attack scenarios (prompt injection, masquerading, plain
   malware, hidden PowerShell, fake svchost, memory, full attack chain, and a false-alarm
-  check), with results posted to Discord.
+  check), with results posted to Discord. A live window follows each test attack through
+  the agents step by step, showing how it's read and stopped, and lets you approve or deny
+  it right there.
 
 ## What you need
 
