@@ -1,0 +1,116 @@
+# =============================================================================
+# Zero-Trust Multi-Agent AI SOC — Hub
+# =============================================================================
+# Exposure model:
+#   * soc-orchestrator  -> published ONLY on ${TAILSCALE_IP}:${ORCHESTRATOR_PORT}
+#   * chromadb          -> NOT published at all. Reachable only by the
+#                          orchestrator over the internal (no-egress) network.
+#
+# If TAILSCALE_IP is unset, compose refuses to start (":?" guard) instead of
+# silently falling back to 0.0.0.0. If the IP is set but not present on the
+# host (Tailscale down), Docker fails with "cannot assign requested address".
+# Both are fail-closed.
+# =============================================================================
+
+name: soc-hub
+
+services:
+  chromadb:
+    image: chromadb/chroma:${CHROMA_IMAGE_TAG:-latest}
+    container_name: soc-chromadb
+    restart: unless-stopped
+    # No `ports:` block on purpose. Chroma 1.x has no built-in auth, so the
+    # network boundary IS the access control.
+    networks:
+      - soc_internal
+    volumes:
+      - chroma_data:/data
+    environment:
+      ANONYMIZED_TELEMETRY: "FALSE"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 1g
+    pids_limit: 256
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  soc-orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    image: soc-orchestrator:local
+    container_name: soc-orchestrator
+    restart: unless-stopped
+    depends_on:
+      - chromadb
+    ports:
+      # Host side bound to the Tailscale interface only. Never 0.0.0.0.
+      - "${TAILSCALE_IP:?TAILSCALE_IP must be set in .env}:${ORCHESTRATOR_PORT:-8080}:8000"
+      # Loopback only, for `tailscale serve` (HTTPS for passkeys). tailscaled
+      # can't proxy to its own Tailscale IP. 127.0.0.1 isn't reachable off-box.
+      - "127.0.0.1:${ORCHESTRATOR_PORT:-8080}:8000"
+    networks:
+      - soc_internal   # talks to Chroma
+      - soc_egress     # outbound HTTPS to Gemini + Discord webhook
+    env_file:
+      - .env
+    environment:
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
+      GEMINI_API_KEY_FILE: /run/secrets/gemini_api_key
+      DISCORD_WEBHOOK_URL_FILE: /run/secrets/discord_webhook_url
+      SHIPPER_TOKEN_FILE: /run/secrets/shipper_token
+      ACTION_SIGNING_SECRET_FILE: /run/secrets/action_signing_secret
+      EXECUTION_SIGNING_KEY_FILE: /run/secrets/execution_signing_key
+    secrets:
+      - gemini_api_key
+      - discord_webhook_url
+      - shipper_token
+      - action_signing_secret
+      - execution_signing_key
+    volumes:
+      - warden_data:/var/lib/soc   # enrolled passkeys (public keys) + enrollment code hash
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 1g
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+
+networks:
+  soc_internal:
+    driver: bridge
+    internal: true        # no route to the internet, no port publishing
+  soc_egress:
+    driver: bridge
+
+volumes:
+  chroma_data:
+  warden_data:
+
+secrets:
+  gemini_api_key:
+    file: ./secrets/gemini_api_key.txt
+  discord_webhook_url:
+    file: ./secrets/discord_webhook_url.txt
+  shipper_token:
+    file: ./secrets/shipper_token.txt
+  action_signing_secret:
+    file: ./secrets/action_signing_secret.txt
+  execution_signing_key:
+    file: ./secrets/execution_signing_key.txt

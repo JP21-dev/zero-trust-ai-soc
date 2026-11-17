@@ -1,0 +1,15 @@
+# Compatible-release ranges. Before you deploy for real, lock exact versions
+# with hashes so a compromised upstream release can't slip in:
+#   pip install pip-tools
+#   pip-compile --generate-hashes -o requirements.lock requirements.txt
+# then switch the Dockerfile to `pip install --require-hashes -r requirements.lock`.
+
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.32,<1.0
+langgraph>=1.0,<2.0
+chromadb-client>=1.0,<2.0
+httpx>=0.27,<1.0
+cryptography>=43
+webauthn>=2.8,<3
+pydantic>=2.9,<3.0
+pydantic-settings>=2.6,<3.0
