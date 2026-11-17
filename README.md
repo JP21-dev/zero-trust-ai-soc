@@ -29,6 +29,18 @@ through the real pipeline and posts pass/fail to Discord.
 > replacement for Microsoft Defender or a commercial EDR. Read [Limitations](#limitations)
 > before relying on it.
 
+## Screenshots
+
+![Dashboard: a passkey approval waiting at the top, the five agents working live, and every batch flowing through the pipeline](docs/screenshots/dashboard.png)
+
+*The dashboard: the Warden has paused a plain-malware connection and is waiting for a passkey approval, while the other agents keep analyzing live telemetry.*
+
+![Test lab: ten attack scenarios, all passing](docs/screenshots/test-lab.png)
+
+*The test lab: ten fake attacks run through the real agents, each checked step by step.*
+
+<sub>Screenshots use demo data: made-up devices and documentation-only IP addresses.</sub>
+
 ## Features
 
 - **Human-in-the-loop by design.** The AI can only *propose*. Every block needs a FIDO2
@@ -172,3 +184,5 @@ See [SECURITY.md](SECURITY.md) for the threat model and how to report a vulnerab
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+*Created by Lapis Forge.*
