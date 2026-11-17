@@ -51,6 +51,7 @@ class Activity:
         self.blocks: dict[str, dict[str, Any]] = {}   # "endpoint|ip" -> block
         self.started_at = time.time()
         self.busy: dict[str, dict[str, Any]] = {}     # agent -> {"since", "endpoint_id", "test"}
+        self.audit = None                              # AuditLog, set by the app
         self._lock = threading.Lock()
         self._appends = 0
 
@@ -93,6 +94,8 @@ class Activity:
         with self._lock:
             self._apply(ev)
             self._append(ev)
+        if kind != "batch" and self.audit is not None:   # security events also go to the hash chain
+            self.audit.append(ev)
         return ev
 
     def touch_poll(self, endpoint_id: str) -> None:

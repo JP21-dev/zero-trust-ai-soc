@@ -29,6 +29,18 @@ TEST_NETS = tuple(ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.
 REDACTION = "[REDACTED:prompt-injection]"
 
 
+TEST_USER_DIR = "c:\\users\\analyst\\"   # every test-lab file lives under this fake profile
+EICAR_SHA256 = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
+
+
+def is_test_path(path: str | None) -> bool:
+    return bool(path) and str(path).lower().startswith(TEST_USER_DIR) and ".." not in str(path)
+
+
+def _fake_sha() -> str:
+    return "".join(random.choice("0123456789abcdef") for _ in range(64))
+
+
 def is_test_net(ip: str | None) -> bool:
     try:
         return ip is not None and any(ipaddress.ip_address(ip) in n for n in TEST_NETS)
@@ -160,6 +172,84 @@ def _spoof_checks(runs, thr, discord):
               ", ".join(sorted({a["variant"] for a in claim})) or "not caught"),
         floor_held(st, 30),
         warden_consistent(st, thr),
+    ]
+
+
+def _sysmon(event_type: str, process: str, exe: str, **kw: Any) -> dict[str, Any]:
+    e = _ev(process, exe, None, None, cmdline=kw.pop("cmdline", None), user=kw.pop("user", "SOC-TEST-LAB\\analyst"))
+    e.update(event_type=event_type, dst_ip=None, dst_port=None, protocol=None, **kw)
+    return e
+
+
+def _eicar_batches():
+    return [[_sysmon("file", "chrome.exe", r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                     file_path=r"C:\Users\analyst\Downloads\invoice_2024.pdf.exe", sha256=EICAR_SHA256)]]
+
+
+def _eicar_checks(runs, thr, discord):
+    st = runs[0]
+    tf = st.get("target_file") or {}
+    return [
+        check("Gatekeeper kept it even though Chrome (a known-safe app) wrote it", st.get("dropped_count") == 0),
+        check("Strategist matched the known-malware fingerprint (EICAR)", "known_malware" in _flags(st)),
+        check("Strategist spotted the double extension (.pdf.exe)", "double_extension" in _flags(st)),
+        escalated(st, thr),
+        check("Warden proposed quarantining exactly that file (by path + fingerprint)",
+              tf.get("path", "").lower().endswith("invoice_2024.pdf.exe") and tf.get("sha256") == EICAR_SHA256
+              and not st.get("target_ip"), f"{tf.get('path')}"),
+    ]
+
+
+def _macro_batches():
+    return [[_sysmon("process", "powershell.exe", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                     sha256=_fake_sha(), parent_name="WINWORD.EXE",
+                     parent_path=r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE",
+                     cmdline="powershell.exe -nop -w hidden -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIAA=")]]
+
+
+def _macro_checks(runs, thr, discord):
+    st = runs[0]
+    return [
+        check("Strategist flagged Word launching PowerShell", "office_child" in _flags(st)),
+        check("…with a hidden, encoded command", "obfuscated_command" in _flags(st)),
+        escalated(st, thr),
+        check("Warden doesn't try to quarantine Windows' own PowerShell (asks for review instead)",
+              not st.get("target_file") and not st.get("target_ip")),
+    ]
+
+
+def _persist_batches():
+    exe = r"C:\Users\analyst\AppData\Local\Temp\updater.exe"
+    return [[_sysmon("registry", "updater.exe", exe, sha256=_fake_sha(),
+                     reg_key=r"HKU\S-1-5-21-1000\Software\Microsoft\Windows\CurrentVersion\Run\Updater",
+                     reg_value=exe)]]
+
+
+def _persist_checks(runs, thr, discord):
+    st = runs[0]
+    tf = st.get("target_file") or {}
+    return [
+        check("Strategist flagged a new auto-start (Run key) entry", "startup_persistence" in _flags(st)),
+        check("…pointing at a program in Temp", "suspicious_location" in _flags(st)),
+        escalated(st, thr),
+        check("Warden proposed quarantining the program that set it", tf.get("path", "").lower().endswith("updater.exe"),
+              str(tf.get("path"))),
+    ]
+
+
+def _lsass_batches():
+    return [[_sysmon("lsass", "procdump64.exe", r"C:\Users\analyst\Downloads\procdump64.exe", sha256=_fake_sha(),
+                     target_process=r"C:\Windows\System32\lsass.exe", granted_access="0x1fffff")]]
+
+
+def _lsass_checks(runs, thr, discord):
+    st = runs[0]
+    tf = st.get("target_file") or {}
+    return [
+        check("Strategist flagged a password-theft attempt on LSASS", "credential_theft" in _flags(st)),
+        escalated(st, thr),
+        check("Warden proposed quarantining the tool, never lsass.exe itself",
+              tf.get("path", "").lower().endswith("procdump64.exe"), str(tf.get("path"))),
     ]
 
 
@@ -322,6 +412,22 @@ SCENARIOS: dict[str, Scenario] = {s.id: s for s in [
              "A Windows system program name running from C:\\Users\\Public.",
              ("gatekeeper", "strategist", "warden"), _svchost_batches, _svchost_checks,
              expected="Disguise + Public folder → Warden pauses"),
+    Scenario("eicar_download", "Known malware download", "📥",
+             "Chrome saves invoice_2024.pdf.exe to Downloads. Its fingerprint is the EICAR test file.",
+             ("gatekeeper", "strategist", "warden"), _eicar_batches, _eicar_checks,
+             expected="Fingerprint + double extension → quarantine proposed"),
+    Scenario("office_macro", "Office macro launches PowerShell", "📄",
+             "Word starts PowerShell with a hidden window and an encoded command (Sysmon process event).",
+             ("strategist", "warden"), _macro_batches, _macro_checks,
+             expected="Office → PowerShell + hidden command → Warden pauses"),
+    Scenario("run_key", "Auto-start persistence", "🔁",
+             "A program in Temp adds itself to the registry Run key (Sysmon registry event).",
+             ("strategist", "warden"), _persist_batches, _persist_checks,
+             expected="Persistence + Temp folder → quarantine proposed"),
+    Scenario("lsass", "Password theft (LSASS)", "🔑",
+             "A dump tool from Downloads opens lsass.exe, where Windows keeps passwords (Sysmon event 10).",
+             ("strategist", "warden"), _lsass_batches, _lsass_checks,
+             expected="Credential theft → quarantine the tool"),
     Scenario("normal_apps", "Normal apps (false-alarm check)", "🎵",
              "Spotify, Discord and VS Code making new connections.",
              ("strategist", "warden"), _normal_batches, _normal_checks,

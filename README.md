@@ -58,6 +58,17 @@ through the real pipeline and posts pass/fail to Discord.
 - **Memory that can't be poisoned.** Only clean, low-score connections are learned as
   normal; anything with a red flag is never learned.
 - **No alert spam.** One open approval per threat; a denied threat is muted for 30 minutes.
+- **File and process detection with Microsoft Sysmon.** Program launches (with fingerprints
+  and parent), files dropped in Downloads/Temp/Public/Startup, auto-start registry entries,
+  LSASS password-theft attempts, code injection, unsigned drivers and process tampering.
+  Rules catch known-malware fingerprints (EICAR, your own list, and abuse.ch MalwareBazaar
+  with a free key), double extensions like `.pdf.exe`, and Office apps launching scripts.
+- **Passkey-approved quarantine.** For a malicious file the Warden proposes a quarantine; once
+  you approve, the endpoint moves the file only if its fingerprint still matches, never
+  touches `C:\Windows` or Program Files, and can restore it (`shipper.py --restore`).
+- **Hardened Hub.** Per-endpoint tokens (a laptop can only speak for itself), rate limits,
+  container CPU/memory/process caps, and a hash-chained audit log with daily checkpoints in
+  Discord, so rewritten history is detectable.
 - **Silent-agent alerts.** Malware often stops security tools first. If an endpoint's agent
   stops checking in while Tailscale still shows the machine online, you get a Discord alert
   (a laptop that's just asleep doesn't trigger one). Tailnet machines without the agent show

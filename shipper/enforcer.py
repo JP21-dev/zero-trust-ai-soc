@@ -10,13 +10,21 @@ the Ed25519-signed payload bytes, and only if:
   * it is inside its validity window (60 s clock-skew allowance);
   * it was approved with a real passkey signature (approval.method == "webauthn"),
     unless SOC_ALLOW_SIMULATED_ORDERS=1 for development;
-  * the action is supported (block_ip) and the target is a sane, routable IP
-    that isn't the tailnet or the Hub (so an order can never cut the SOC off);
+  * the action is supported and its target is safe:
+      block_ip        a sane, routable IP that isn't the tailnet or the Hub
+                      (so an order can never cut the SOC off);
+      quarantine_file an absolute local path outside C:\\Windows, Program Files,
+                      ProgramData\\Microsoft and the SOC's own folders, plus the
+                      file's SHA-256. At apply time the file must still hash to
+                      exactly that value (no swapping it after approval) and must
+                      not be a link/junction into a protected folder;
   * its order_id has never been applied before (persisted, survives restarts).
 
 Blocks are applied as Windows Firewall rules (inbound + outbound, all profiles)
-via netsh, and reported back to the Hub. On non-Windows systems, or with
-SOC_ENFORCE_DRY_RUN=1, a log-only backend records what it would have done.
+via netsh. Quarantine stops processes running from the file, then moves it into
+<state>\\quarantine (SYSTEM + Administrators only) with a restore record. Both are
+reported back to the Hub. On non-Windows systems, or with SOC_ENFORCE_DRY_RUN=1,
+log-only backends record what they would have done.
 """
 from __future__ import annotations
 
@@ -27,6 +35,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -45,7 +55,13 @@ log = logging.getLogger("soc-shipper")
 
 IS_WINDOWS = sys.platform == "win32"
 CLOCK_SKEW = 60
-SUPPORTED_ACTIONS = {"block_ip"}
+SUPPORTED_ACTIONS = {"block_ip", "quarantine_file"}
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+# Never quarantine anything under these (compared case-insensitively, Windows-style).
+PROTECTED_ROOTS = (
+    "c:\\windows\\", "c:\\program files\\", "c:\\program files (x86)\\",
+    "c:\\programdata\\microsoft\\", "c:\\socshipper\\",
+)
 TAILNET = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
 RULE_PREFIX = "SOC-Warden"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -138,13 +154,40 @@ def validate_target(ip_text: Any, protected: set[str]) -> str:
     return str(ip)
 
 
+def _win_norm(path: str) -> str:
+    return os.path.normpath(path.replace("/", "\\")).lower() if "\\" in path or ":" in path else os.path.normpath(path).lower()
+
+
+def validate_file_target(path_text: Any, sha_text: Any, protected_roots: tuple[str, ...]) -> tuple[str, str]:
+    """Syntax/policy checks on a quarantine target. Existence and hash are checked at apply time."""
+    path, sha = str(path_text or ""), str(sha_text or "").lower()
+    if not _SHA256.match(sha):
+        raise OrderRejected("quarantine order has no valid SHA-256")
+    if not path or len(path) > 1024 or "\x00" in path:
+        raise OrderRejected("quarantine order has no valid file path")
+    if path.startswith("\\\\") or path.startswith("//"):
+        raise OrderRejected("refusing network/device paths")
+    is_abs = bool(re.match(r"^[A-Za-z]:[\\/]", path)) or (not IS_WINDOWS and path.startswith("/"))
+    if not is_abs:
+        raise OrderRejected("quarantine path must be absolute")
+    if ".." in re.split(r"[\\/]", path):
+        raise OrderRejected("quarantine path must not contain '..'")
+    norm = _win_norm(path)
+    for root in protected_roots:
+        if (norm + ("\\" if "\\" in root else "/")).startswith(root):
+            raise OrderRejected(f"refusing to quarantine a file under a protected folder ({root.rstrip(chr(92))})")
+    return path, sha
+
+
 class OrderVerifier:
     def __init__(self, key: PinnedKey, endpoint_id: str, *, allow_simulated: bool = False,
-                 protected_ips: set[str] | None = None) -> None:
+                 protected_ips: set[str] | None = None,
+                 protected_roots: tuple[str, ...] = PROTECTED_ROOTS) -> None:
         self.key = key
         self.endpoint_id = endpoint_id
         self.allow_simulated = allow_simulated
         self.protected = protected_ips or set()
+        self.protected_roots = protected_roots
 
     def verify(self, signed: dict[str, Any], now: float | None = None) -> dict[str, Any]:
         """Return the verified order, built ONLY from the signed payload bytes."""
@@ -187,9 +230,14 @@ class OrderVerifier:
         if approval.get("user_verified") is not True:
             raise OrderRejected("approval lacked user verification")
 
-        if order.get("action") not in SUPPORTED_ACTIONS:
-            raise OrderRejected(f"unsupported action {order.get('action')!r}")
-        order["target_ip"] = validate_target(order.get("target_ip"), self.protected)
+        action = order.get("action")
+        if action not in SUPPORTED_ACTIONS:
+            raise OrderRejected(f"unsupported action {action!r}")
+        if action == "block_ip":
+            order["target_ip"] = validate_target(order.get("target_ip"), self.protected)
+        else:
+            order["target_path"], order["target_sha256"] = validate_file_target(
+                order.get("target_path"), order.get("target_sha256"), self.protected_roots)
         if not _SAFE_NAME.match(str(order.get("order_id", ""))):
             raise OrderRejected("bad order_id")
         return order
@@ -255,18 +303,129 @@ def default_firewall() -> WindowsFirewall | LogOnlyFirewall:
 
 
 # ---------------------------------------------------------------------------
+# File quarantine
+# ---------------------------------------------------------------------------
+class QuarantineError(Exception):
+    pass
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_link(path: Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    reparse = getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(st.st_mode) or bool(reparse)
+
+
+class Quarantine:
+    """Moves an approved file into <state>/quarantine after re-checking it."""
+
+    def __init__(self, state_dir: Path, protected_roots: tuple[str, ...] = PROTECTED_ROOTS,
+                 dry_run: bool = False) -> None:
+        self.dir = state_dir / "quarantine"
+        self.index = state_dir / "quarantine.json"
+        self.protected_roots = protected_roots
+        self.dry_run = dry_run
+        self.name = "log-only" if dry_run else "quarantine"
+
+    def _check(self, path: str, sha: str) -> Path:
+        p = Path(path)
+        # Re-check the REAL location: a junction/symlink could point into C:\Windows.
+        for part in [p, *p.parents]:
+            if _is_link(part):
+                raise QuarantineError(f"refusing: {part} is a link/junction")
+        real = os.path.realpath(p)
+        validate_file_target(real, sha, self.protected_roots)
+        if not p.is_file():
+            raise QuarantineError("file not found (already removed or moved?)")
+        actual = sha256_file(p)
+        if actual != sha:
+            raise QuarantineError(f"file changed since it was approved (hash {actual[:12]}… ≠ {sha[:12]}…); not touched")
+        return p
+
+    def _stop_processes(self, p: Path) -> list[str]:
+        import psutil
+        target = os.path.normcase(os.path.realpath(p))
+        stopped = []
+        for proc in psutil.process_iter(["pid", "exe", "name"]):
+            exe = proc.info.get("exe")
+            if exe and os.path.normcase(os.path.realpath(exe)) == target:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                    stopped.append(f"{proc.info.get('name')} (pid {proc.info['pid']})")
+                except (psutil.Error, OSError) as exc:
+                    raise QuarantineError(f"couldn't stop {proc.info.get('name')} (pid {proc.info['pid']}): "
+                                          f"{type(exc).__name__}") from None
+        return stopped
+
+    def quarantine(self, path: str, sha: str, order_id: str, meta: dict[str, Any]) -> str:
+        p = self._check(path, sha)
+        if self.dry_run:
+            log.warning("DRY RUN: would quarantine %s (sha256 %s)", p, sha)
+            return f"DRY RUN: would quarantine {p}"
+        stopped = self._stop_processes(p)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        dest = self.dir / f"{sha}-{order_id[:10]}.quarantined"
+        shutil.move(str(p), str(dest))
+        try:
+            os.chmod(dest, stat.S_IREAD)   # inert copy: read-only, no executable name
+        except OSError:
+            pass
+        items = _read_json(self.index, [])
+        items.append({"sha256": sha, "original_path": str(p), "stored_as": dest.name, "order_id": order_id,
+                      "quarantined_at": _now_iso(), "stopped_processes": stopped, **meta})
+        _write_json_atomic(self.index, items)
+        return f"moved to quarantine as {dest.name}" + (f"; stopped {', '.join(stopped)}" if stopped else "")
+
+
+def list_quarantine(state_dir: Path) -> list[dict[str, Any]]:
+    return _read_json(state_dir / "quarantine.json", [])
+
+
+def restore(state_dir: Path, sha_prefix: str) -> str:
+    """Put a quarantined file back where it was (refuses to overwrite)."""
+    items = list_quarantine(state_dir)
+    hits = [i for i in items if i["sha256"].startswith(sha_prefix.lower())]
+    if len(hits) != 1:
+        raise QuarantineError(f"prefix matched {len(hits)} quarantined files; need exactly 1")
+    item = hits[0]
+    src, dst = state_dir / "quarantine" / item["stored_as"], Path(item["original_path"])
+    if dst.exists():
+        raise QuarantineError(f"{dst} exists again; not overwriting it")
+    os.chmod(src, stat.S_IREAD | stat.S_IWRITE)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+    _write_json_atomic(state_dir / "quarantine.json", [i for i in items if i is not item])
+    return str(dst)
+
+
+# ---------------------------------------------------------------------------
 # Enforcer
 # ---------------------------------------------------------------------------
 class Enforcer:
     def __init__(self, *, hub_base_url: str, token: str, endpoint_id: str, state_dir: Path,
                  key: PinnedKey, allow_simulated: bool = False,
-                 protected_ips: set[str] | None = None, firewall=None) -> None:
+                 protected_ips: set[str] | None = None, firewall=None, quarantine=None,
+                 protected_roots: tuple[str, ...] = PROTECTED_ROOTS) -> None:
         self.base = hub_base_url.rstrip("/")
         self.token = token
         self.endpoint_id = endpoint_id
+        roots = protected_roots + (_win_norm(str(state_dir)) + ("\\" if IS_WINDOWS else "/"),)
         self.verifier = OrderVerifier(key, endpoint_id, allow_simulated=allow_simulated,
-                                      protected_ips=protected_ips)
+                                      protected_ips=protected_ips, protected_roots=roots)
         self.firewall = firewall or default_firewall()
+        self.quarantine = quarantine or Quarantine(state_dir, roots,
+                                                   dry_run=isinstance(self.firewall, LogOnlyFirewall))
         self.applied_file = state_dir / "applied_orders.json"
         self.blocks_file = state_dir / "blocks.json"
 
@@ -316,13 +475,17 @@ class Enforcer:
             self._ack(claimed_id, "rejected", str(exc))
             return "rejected"
 
-        oid, ip = order["order_id"], order["target_ip"]
+        oid = order["order_id"]
         applied = _read_json(self.applied_file, {})
         if oid in applied:
             log.info("order %s already applied; re-acking", oid)
             self._ack(oid, "already_applied")
             return "already_applied"
 
+        if order["action"] == "quarantine_file":
+            return self._handle_quarantine(order, applied)
+
+        ip = order["target_ip"]
         try:
             rules = self.firewall.block(ip, oid)
         except Exception as exc:   # netsh failure, not elevated, ...
@@ -330,10 +493,7 @@ class Enforcer:
             self._ack(oid, "failed", str(exc))
             return "failed"
 
-        now = time.time()
-        applied = {k: v for k, v in applied.items() if v > now - 86400}   # keep a day past expiry
-        applied[oid] = int(order["expires_at"])
-        _write_json_atomic(self.applied_file, applied)
+        self._mark_applied(applied, order)
         blocks = _read_json(self.blocks_file, [])
         blocks.append({"ip": ip, "order_id": oid, "rules": rules, "applied_at": _now_iso(),
                        "approved_by": (order.get("approval") or {}).get("credential_label"),
@@ -341,6 +501,31 @@ class Enforcer:
         _write_json_atomic(self.blocks_file, blocks)
         log.warning("ENFORCED order %s: blocked %s via %s", oid, ip, self.firewall.name)
         self._ack(oid, "applied", f"{self.firewall.name}: {', '.join(rules)}")
+        return "applied"
+
+    def _mark_applied(self, applied: dict, order: dict) -> None:
+        now = time.time()
+        applied = {k: v for k, v in applied.items() if v > now - 86400}   # keep a day past expiry
+        applied[order["order_id"]] = int(order["expires_at"])
+        _write_json_atomic(self.applied_file, applied)
+
+    def _handle_quarantine(self, order: dict, applied: dict) -> str:
+        oid, path, sha = order["order_id"], order["target_path"], order["target_sha256"]
+        try:
+            detail = self.quarantine.quarantine(path, sha, oid, {
+                "approved_by": (order.get("approval") or {}).get("credential_label"),
+                "threat_score": order.get("threat_score")})
+        except (QuarantineError, OrderRejected) as exc:
+            log.error("REFUSED quarantine order %s (%s): %s", oid, path, exc)
+            self._ack(oid, "rejected", str(exc))
+            return "rejected"
+        except Exception as exc:   # file in use, permissions, ...
+            log.error("FAILED quarantine order %s (%s): %s", oid, path, exc)
+            self._ack(oid, "failed", f"{type(exc).__name__}: {exc}")
+            return "failed"
+        self._mark_applied(applied, order)
+        log.warning("ENFORCED order %s: quarantined %s (%s)", oid, path, detail)
+        self._ack(oid, "applied", f"{self.quarantine.name}: {detail}")
         return "applied"
 
 

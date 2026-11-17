@@ -521,6 +521,8 @@ function dur(s) {
 }
 const isoTs = (iso) => (iso ? Date.parse(iso) / 1000 : null);
 const testTag = () => el("span", { class: "tag test", text: "TEST" });
+// What an action/order/event targets: a file to quarantine, or an IP to block.
+const tgt = (x) => x.target_path || x.target_file || x.target_ip || "(no target)";
 function table(headers, rows, emptyText) {
   if (!rows.length) return el("div", { class: "empty-note", text: emptyText || "Nothing yet." });
   return el("table", null,
@@ -626,7 +628,7 @@ function renderPending(d) {
     el("div", { class: "big-score" }, String(p.threat_score), el("small", { text: "threat" })),
     el("div", null,
       el("div", { class: "what" }, p.test ? testTag() : null, p.test ? " " : null,
-        "Approve ", el("code", { text: p.action }), " on ", el("code", { text: p.target_ip || "no target" }),
+        "Approve ", el("code", { text: p.action }), " on ", el("code", { text: tgt(p) }),
         " for ", el("code", { text: p.endpoint_id }), "?"),
       el("ul", null, (p.attack_signatures.length ? p.attack_signatures : ["No signature given"]).map((s) => el("li", { text: s })))),
     el("div", { class: "side" },
@@ -708,9 +710,9 @@ function renderAgents(d) {
   }));
 }
 function enforcerText(e) {
-  if (e.kind === "enforced") return "blocked " + e.target_ip + " on " + e.endpoint_id;
-  if (e.kind === "enforce_failed") return "failed to block " + e.target_ip;
-  return "picked up an order for " + e.target_ip;
+  if (e.kind === "enforced") return (e.target_path ? "quarantined " : "blocked ") + tgt(e) + " on " + e.endpoint_id;
+  if (e.kind === "enforce_failed") return "failed to act on " + tgt(e);
+  return "picked up an order for " + tgt(e);
 }
 
 // ---------- live pipeline feed ----------
@@ -804,7 +806,8 @@ function renderDevices(d) {
     }
     const tn = w.tailnet ? " · Tailscale: " + (w.tailnet.online ? "online" : "offline") + (w.tailnet.name ? " as " + w.tailnet.name : "") : "";
     cards.push(device("💻", e.endpoint_id, ["Endpoint", "Telemetry shipper", "Firewall enforcer"], st, doing,
-      num(e.events) + " connections reported · " + plural(e.escalations, "alert") + " · " + plural(e.blocks, "block") + tn));
+      num(e.events) + " connections reported · " + plural(e.escalations, "alert") + " · " + plural(e.blocks, "block") + tn
+      + (d.token_kind[e.endpoint_id] === "shared" ? " · ⚠ uses the old shared token" : d.token_kind[e.endpoint_id] ? " · own token" : "")));
   }
   for (const u of d.watch.unprotected || []) {
     cards.push(device(u.os.toLowerCase() === "windows" ? "💻" : "🖥️", u.name || u.host, ["On your tailnet", "Not protected"],
@@ -1063,15 +1066,15 @@ function scoreChart(series, thr) {
 // ---------- history ----------
 const KINDS = {
   hub_started: ["⏻", (e) => "Hub started (" + plural(e.passkeys, "passkey") + ", signing key " + e.key_id + ")"],
-  escalated: ["🛑", (e) => `Warden escalated: ${e.action} ${e.target_ip || "(no target)"} on ${e.endpoint_id}, score ${e.threat_score}` + (e.discord === false ? " (Discord alert FAILED)" : "")],
-  approved: ["✅", (e) => `Approved by ${e.approved_by}: ${e.action} ${e.target_ip || ""} on ${e.endpoint_id}`],
-  approval_rejected: ["🚫", (e) => `Approval attempt rejected for ${e.target_ip || "?"}: ${e.reason}`],
-  denied: ["⛔", (e) => `Denied: ${e.action} ${e.target_ip || ""} on ${e.endpoint_id}`],
-  challenge_expired: ["⌛", (e) => `Approval window expired, auto-denied: ${e.target_ip || "(no target)"} on ${e.endpoint_id}`],
-  order_picked_up: ["📥", (e) => `Enforcer on ${e.endpoint_id} picked up the order for ${e.target_ip}`],
-  enforced: ["🧱", (e) => (e.test ? `Simulated block of ${e.target_ip} (test lab)` : `Blocked ${e.target_ip} on ${e.endpoint_id}`) + (e.status === "already_applied" ? " (already in place)" : "")],
-  enforce_failed: ["❌", (e) => `Enforcement ${e.status} for ${e.target_ip} on ${e.endpoint_id}: ${e.detail || "no detail"}`],
-  order_expired: ["⚠️", (e) => `Approved order for ${e.target_ip} expired before ${e.endpoint_id} picked it up. Nothing was blocked.`],
+  escalated: ["🛑", (e) => `Warden escalated: ${e.action} ${tgt(e)} on ${e.endpoint_id}, score ${e.threat_score}` + (e.discord === false ? " (Discord alert FAILED)" : "")],
+  approved: ["✅", (e) => `Approved by ${e.approved_by}: ${e.action} ${tgt(e)} on ${e.endpoint_id}`],
+  approval_rejected: ["🚫", (e) => `Approval attempt rejected for ${tgt(e)}: ${e.reason}`],
+  denied: ["⛔", (e) => `Denied: ${e.action} ${tgt(e)} on ${e.endpoint_id}`],
+  challenge_expired: ["⌛", (e) => `Approval window expired, auto-denied: ${tgt(e)} on ${e.endpoint_id}`],
+  order_picked_up: ["📥", (e) => `Enforcer on ${e.endpoint_id} picked up the order for ${tgt(e)}`],
+  enforced: ["🧱", (e) => (e.test ? `Simulated ${e.target_path ? "quarantine" : "block"} of ${tgt(e)} (test lab)` : `${e.target_path ? "Quarantined" : "Blocked"} ${tgt(e)} on ${e.endpoint_id}`) + (e.status === "already_applied" ? " (already in place)" : "")],
+  enforce_failed: ["❌", (e) => `Enforcement ${e.status} for ${tgt(e)} on ${e.endpoint_id}: ${e.detail || "no detail"}`],
+  order_expired: ["⚠️", (e) => `Approved order for ${tgt(e)} expired before ${e.endpoint_id} picked it up. Nothing was blocked.`],
   passkey_enrolled: ["🔑", (e) => `Passkey enrolled: ${e.label} (${e.device_type})`],
   dashboard_login: ["🔓", (e) => `Dashboard sign-in with ${e.label}`],
   dashboard_login_failed: ["🔒", (e) => `Dashboard sign-in failed: ${e.reason}`],
@@ -1079,6 +1082,7 @@ const KINDS = {
   endpoint_silent: ["🚨", (e) => e.state === "silent_online"
     ? `${e.endpoint_id}'s agent went silent while the machine is online` + (e.is_hub ? " (the Hub itself)" : "") + ` (quiet ${Math.round(e.quiet_seconds / 60)} min)`
     : `${e.endpoint_id} stopped checking in (no Tailscale data to tell if it's asleep)`],
+  audit_broken: ["🚨", (e) => `Audit log failed verification at entry ${e.broken_at} of ${e.entries}: history was modified`],
   endpoint_back: ["✅", (e) => `${e.endpoint_id} is checking in again after ${Math.max(1, Math.round(e.quiet_seconds / 60))} min`],
 };
 function renderTimeline(d) {
@@ -1113,7 +1117,13 @@ function renderSystem(d) {
     ["Gemini", h.gemini === "off" ? "No API key: built-in rules" : h.gemini_model + " · " + (h.gemini_status || "no calls yet")],
     ["Memory", h.chroma ? num(h.memory_fingerprints) + " connections remembered" : "ChromaDB unreachable"],
     ["Hub started", ago(d.hub_started_at, d.now)],
-    ["Queued orders", d.orders.length ? d.orders.map((o) => o.target_ip + (o.picked_up ? " (picked up)" : " (waiting)")).join(", ") : "none"],
+    ["Threat intel", (d.intel.feed ? num(d.intel.feed) + " MalwareBazaar" : "No MalwareBazaar") + " + " + num(d.intel.custom)
+      + " custom fingerprints + EICAR" + (d.intel.updated_at ? " · updated " + ago(d.intel.updated_at, d.now) : "")
+      + (d.intel.last_error ? " · MalwareBazaar: " + d.intel.last_error : "")],
+    ["Audit log", d.audit.verified ? num(d.audit.entries) + " entries · hash chain verified · head " + d.audit.head.slice(0, 12) + "…"
+      : "⚠ BROKEN at entry " + d.audit.broken_at + " of " + d.audit.entries + ": history was modified"],
+    ["Endpoint tokens", d.strict_tokens ? "Per-endpoint only (shared token refused)" : "Per-endpoint preferred; shared token still accepted"],
+    ["Queued orders", d.orders.length ? d.orders.map((o) => tgt(o) + (o.picked_up ? " (picked up)" : " (waiting)")).join(", ") : "none"],
   ];
   $("system").replaceChildren(...kv.flatMap(([k, v]) => [el("dt", { text: k }), el("dd", { text: v })]));
   $("passkeys").replaceChildren(...(d.passkeys.length ? d.passkeys.map((p) => el("li", null,
@@ -1211,7 +1221,8 @@ function renderLive(d) {
     el("div", { class: "lbl", text: "The attack" + (atk.of > 1 ? " · batch " + atk.batch + " of " + atk.of : "") }),
     el("div", { class: "muted small", text: run.tagline }),
     ...atk.events.map((e) => el("div", null,
-      el("div", { class: "ev" }, el("code", { text: e.process }), el("span", { class: "arrow", text: "→" }), el("code", { text: e.dst }),
+      el("div", { class: "ev" }, e.type && e.type !== "connection" ? el("span", { class: "tag", text: e.type }) : null,
+        el("code", { text: e.process }), el("span", { class: "arrow", text: "→" }), el("code", { text: e.dst }),
         e.user && /root|admin/i.test(e.user) ? el("span", { class: "tag crit", text: "user " + e.user }) : null),
       e.path ? el("span", { class: "cmd mono", text: e.path }) : null,
       e.cmdline && e.cmdline !== e.path ? el("span", { class: "cmd mono", text: "› " + e.cmdline }) : null))] : []));
@@ -1234,7 +1245,7 @@ function renderLive(d) {
     } else if (e.kind === "batch_done") {
       const dec = String(e.decision || "");
       if (dec.startsWith("pending")) items.push(["🛑", "stop", "<b>Attack stopped.</b> Score " + e.score + " ≥ " + thr
-        + ": the Warden paused it before anything ran" + (e.target_ip ? " and proposed blocking " + e.target_ip : "") + "."]);
+        + ": the Warden paused it before anything ran" + (e.target_file ? " and proposed quarantining " + e.target_file : e.target_ip ? " and proposed blocking " + e.target_ip : "") + "."]);
       else if (dec === "already_pending") items.push(["🔁", "good", "<b>Same threat again, no second alert.</b> One approval is already waiting for it."]);
       else if (dec === "all_events_known_safe") items.push(["✅", "good", "<b>Nothing to stop:</b> every connection was a known-safe app."]);
       else items.push(["📝", e.score >= 50 ? "warn" : "good", "<b>Logged, not blocked:</b> score " + e.score + " is below " + thr

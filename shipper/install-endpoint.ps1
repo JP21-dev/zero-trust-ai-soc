@@ -61,6 +61,7 @@ param(
     [string]$ExpectedKeyId,
     [switch]$DryRunEnforcement,
     [switch]$CheckOnly,
+    [switch]$SkipSysmon,
     [string]$InstallDir = "C:\SOCShipper",
     [string]$StateDir = (Join-Path $env:ProgramData "SOCShipper"),
     [string]$TaskName = "SOCShipper"
@@ -72,7 +73,7 @@ param(
 $ErrorActionPreference = "Continue"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-function Step($n, $text) { Write-Host ""; Write-Host "[$n/6] $text" -ForegroundColor Magenta }
+function Step($n, $text) { Write-Host ""; Write-Host "[$n/7] $text" -ForegroundColor Magenta }
 function Ok($text)   { Write-Host "  OK  $text" -ForegroundColor Green }
 function Info($text) { Write-Host "      $text" }
 function Fail($text) { Write-Host "  !!  $text" -ForegroundColor Red; exit 1 }
@@ -82,7 +83,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $CheckOnly -and -not $isAdmin) {
     Fail "Run this from an elevated PowerShell (right-click PowerShell > Run as administrator)."
 }
-foreach ($f in "shipper.py", "enforcer.py", "requirements.txt") {
+foreach ($f in "shipper.py", "enforcer.py", "sysmon.py", "sysmon-config.xml", "requirements.txt") {
     if (-not (Test-Path (Join-Path $here $f))) { Fail "$f not found next to this script ($here)." }
 }
 
@@ -124,7 +125,7 @@ $venvPy  = Join-Path $InstallDir ".venv\Scripts\python.exe"
 $venvPyw = Join-Path $InstallDir ".venv\Scripts\pythonw.exe"
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($CheckOnly) {
-    Info "Would copy shipper.py, enforcer.py, requirements.txt and build a venv."
+    Info "Would copy shipper.py, enforcer.py, sysmon.py, sysmon-config.xml, requirements.txt and build a venv."
     Info ("Existing install: " + $(if (Test-Path $venvPy) { "yes (will be updated)" } else { "no" }))
     Info ("Scheduled task '$TaskName': " + $(if ($task) { $task.State } else { "not registered" }))
 } else {
@@ -141,7 +142,7 @@ if ($CheckOnly) {
         icacls (Join-Path $InstallDir "*") /reset /T /C /Q | Out-Null
         if ($LASTEXITCODE) { Fail "Couldn't reset permissions inside $InstallDir (icacls exit $LASTEXITCODE)." }
     }
-    Copy-Item (Join-Path $here "shipper.py"), (Join-Path $here "enforcer.py"), (Join-Path $here "requirements.txt") $InstallDir -Force -ErrorAction Stop
+    Copy-Item (Join-Path $here "shipper.py"), (Join-Path $here "enforcer.py"), (Join-Path $here "sysmon.py"), (Join-Path $here "sysmon-config.xml"), (Join-Path $here "requirements.txt") $InstallDir -Force -ErrorAction Stop
     if (-not (Test-Path (Join-Path $InstallDir ".venv\pyvenv.cfg"))) {
         & $py.Path -m venv --clear (Join-Path $InstallDir ".venv"); if ($LASTEXITCODE) { Fail "venv creation failed." }
     }
@@ -155,23 +156,42 @@ if ($CheckOnly) {
 # ------------------------------------------------------------------ 3. Token
 Step 3 "Shipper token in $StateDir"
 $tokenDest = Join-Path $StateDir "token.txt"
-if (-not $TokenFile) {
-    $hubToken = Join-Path (Split-Path -Parent $here) "secrets\shipper_token.txt"
-    if (Test-Path $hubToken) { $TokenFile = $hubToken }
-}
+# This machine's endpoint id, exactly as the shipper computes it (lower-case hostname).
+$epId = if (Test-Path $venvPy) {
+    (& $venvPy -c "import os,re,socket;print(re.sub(r'[^A-Za-z0-9._-]','-',(os.environ.get('SOC_ENDPOINT_ID') or socket.gethostname()).lower())[:64])").Trim()
+} else { ($env:COMPUTERNAME.ToLower() -replace '[^a-z0-9._-]', '-') }
+$onHubBox = Test-Path (Join-Path (Split-Path -Parent $here) "secrets\action_signing_secret.txt")
+function Test-EndpointToken($t) { return ($t -match '^(.+)\.[A-Za-z0-9_-]{43}$') -and ($Matches[1] -eq $epId) }
 if ($CheckOnly) {
-    Info ("Token source: " + $(if ($TokenFile) { $TokenFile } elseif (Test-Path $tokenDest) { "keep existing $tokenDest" } else { "would ask you to paste it" }))
+    Info "Endpoint id: $epId"
+    Info ("Token: " + $(if ($TokenFile) { $TokenFile } elseif ($onHubBox) { "would issue a per-endpoint token from the Hub container" }
+                        elseif (Test-Path $tokenDest) { "keep existing $tokenDest" } else { "would ask you to paste a per-endpoint token" }))
 } else {
     New-Item -ItemType Directory -Force -Path $StateDir -ErrorAction Stop | Out-Null
+    $token = $null
     if ($TokenFile) {
         $token = (Get-Content -Raw -LiteralPath $TokenFile).Trim()
-    } elseif (Test-Path $tokenDest) {
-        $token = (Get-Content -Raw -LiteralPath $tokenDest).Trim(); Info "Keeping the existing token."
-    } else {
-        $sec = Read-Host "  Paste the shipper token (from the Hub's secrets\shipper_token.txt)" -AsSecureString
+    } elseif ($onHubBox) {
+        # On the Hub: mint this machine's own token inside the container (needs Docker).
+        $issued = (& docker exec soc-orchestrator python -m app.tokens issue $epId 2>$null | Select-Object -Last 1)
+        if ($LASTEXITCODE -eq 0 -and $issued) { $token = "$issued".Trim(); Info "Issued a per-endpoint token for $epId." }
+        else { Info "Couldn't issue a token from the Hub container (is it running?). Falling back." }
+    }
+    if (-not $token -and (Test-Path $tokenDest)) {
+        $existing = (Get-Content -Raw -LiteralPath $tokenDest).Trim()
+        if (Test-EndpointToken $existing) { $token = $existing; Info "Keeping the existing per-endpoint token." }
+    }
+    if (-not $token) {
+        Info "On the Hub, run:  docker exec soc-orchestrator python -m app.tokens issue $epId"
+        $sec = Read-Host "  Paste the token it prints" -AsSecureString
         $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)).Trim()
     }
-    if ($token.Length -lt 32) { Fail "That token is too short; it should be 64 characters." }
+    if ($token.Length -lt 32) { Fail "That token is too short." }
+    if ($token.Contains(".")) {
+        if (-not (Test-EndpointToken $token)) { Fail "That token was issued for a different machine; it must start with '$epId.'" }
+    } else {
+        Info "Note: that's the old shared token. It works until the Hub enables strict tokens; issue a per-endpoint one soon."
+    }
     icacls $StateDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" /Q | Out-Null
     Set-Content -NoNewline -Encoding ascii -LiteralPath $tokenDest -Value $token -ErrorAction Stop
     Remove-Variable token
@@ -237,22 +257,71 @@ else {
     }
 }
 
-# ------------------------------------------------------------------ 5. Dry run
-Step 5 "Dry run (reads connections, sends nothing)"
+# ------------------------------------------------------------------ 5. Sysmon
+Step 5 "Microsoft Sysmon (file and process visibility)"
+$sysmonCfg = Join-Path $InstallDir "sysmon-config.xml"
+$svc = Get-Service -Name Sysmon64, Sysmon -ErrorAction SilentlyContinue | Select-Object -First 1
+$installedExe = if ($svc) { Join-Path $env:windir ($svc.Name + ".exe") } else { $null }
+if ($SkipSysmon) {
+    Info "Skipped (-SkipSysmon). Only network connections are watched on this machine."
+} elseif ($CheckOnly) {
+    Info $(if ($svc) { "Sysmon is installed ($($svc.Name)); would update its config." }
+           else { "Would download Sysmon from Microsoft (download.sysinternals.com), check Microsoft's signature, and install it." })
+} elseif ($svc -and (Test-Path $installedExe)) {
+    & $installedExe -c $sysmonCfg | Out-Null
+    if ($LASTEXITCODE) { Fail "Sysmon is installed but rejected the config (exit $LASTEXITCODE)." }
+    Ok "Sysmon already installed ($($svc.Name), $($svc.Status)); config updated."
+} else {
+    Info "Sysmon is a free Microsoft Sysinternals tool that records program launches, new files, auto-start"
+    Info "changes and more. Installing it downloads Sysmon.zip from download.sysinternals.com and accepts the"
+    Info "Sysinternals license: https://learn.microsoft.com/sysinternals/license-terms"
+    $ans = Read-Host "  Download and install Sysmon now? [Y/n]"
+    if ($ans -match '^[Nn]') {
+        Info "Skipped. Re-run later (or pass -SkipSysmon) to stop being asked."
+    } else {
+        $tmp = Join-Path $env:TEMP ("sysmon-" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $tmp -ErrorAction Stop | Out-Null
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -UseBasicParsing -Uri "https://download.sysinternals.com/files/Sysmon.zip" `
+                -OutFile (Join-Path $tmp "Sysmon.zip") -ErrorAction Stop
+            Expand-Archive -LiteralPath (Join-Path $tmp "Sysmon.zip") -DestinationPath $tmp -Force -ErrorAction Stop
+            $exe = Join-Path $tmp $(if ([Environment]::Is64BitOperatingSystem) { "Sysmon64.exe" } else { "Sysmon.exe" })
+            $sig = Get-AuthenticodeSignature -LiteralPath $exe
+            if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "O=Microsoft Corporation") {
+                Fail "Downloaded Sysmon is NOT validly signed by Microsoft ($($sig.Status)); not installing it."
+            }
+            Info "Signature verified: $($sig.SignerCertificate.Subject -replace ',.*$', '')"
+            & $exe -accepteula -i $sysmonCfg | Out-Null
+            if ($LASTEXITCODE) { Fail "Sysmon install failed (exit $LASTEXITCODE)." }
+            Ok "Sysmon installed with the SOC config."
+        } catch {
+            Fail "Couldn't download or install Sysmon: $($_.Exception.Message)"
+        } finally {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ------------------------------------------------------------------ 6. Dry run
+Step 6 "Dry run (reads connections, sends nothing)"
 if ($CheckOnly) { Info "Would run: shipper.py --dry-run" }
 else {
     # The batch goes to stdout and the summary line ("# N events, tailscale_up=...") to
     # stderr; merged, their order isn't guaranteed, so search all of it for the summary.
     $dryOut = (& $venvPy (Join-Path $InstallDir "shipper.py") --dry-run 2>&1 | ForEach-Object { "$_" }) -join "`n"
     if ($LASTEXITCODE) { Fail "Dry run failed:`n$($dryOut.Substring([Math]::Max(0, $dryOut.Length - 600)))" }
-    $summary = [regex]::Match($dryOut, "# \d+ events?, tailscale_up=(True|False)")
+    $summary = [regex]::Match($dryOut, "# \d+ events?, tailscale_up=(True|False)(, sysmon=\w+)?")
     if (-not $summary.Success) { Fail "Dry run gave no summary line:`n$($dryOut.Substring([Math]::Max(0, $dryOut.Length - 600)))" }
     if ($summary.Groups[1].Value -ne "True") { Fail "Tailscale doesn't look connected ($($summary.Value)). Connect it and re-run." }
     Ok $summary.Value.TrimStart("# ")
+    if (-not $SkipSysmon -and $summary.Value -match "sysmon=unreadable") {
+        Info "Warning: Sysmon's event log isn't readable yet; file/process events will start once it is."
+    }
 }
 
-# ------------------------------------------------------------------ 6. Scheduled task
-Step 6 "Scheduled task '$TaskName' (at startup, as SYSTEM)"
+# ------------------------------------------------------------------ 7. Scheduled task
+Step 7 "Scheduled task '$TaskName' (at startup, as SYSTEM)"
 $mode = if ($DryRunEnforcement) { "LOG-ONLY enforcement (no firewall changes)" } else { "LIVE enforcement (approved blocks apply)" }
 if ($CheckOnly) { Info "Would register and start it in $mode." ; Write-Host ""; Write-Host "Check only: nothing was changed." -ForegroundColor Magenta; exit 0 }
 if ($DryRunEnforcement) {

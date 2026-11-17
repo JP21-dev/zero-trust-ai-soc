@@ -10,6 +10,7 @@ Git-ignored. One value per file, no trailing newline.
 | `shipper_token.txt` | Bearer token each endpoint's shipper sends to `POST /ingest` | Yes. The orchestrator refuses to start without it |
 | `action_signing_secret.txt` | HMAC key that signs Warden challenges (at least 32 characters) | Yes. The orchestrator refuses to start without it |
 | `execution_signing_key.txt` | Ed25519 private key seed (32 bytes, base64url) that signs approved execution orders | Yes. The orchestrator refuses to start without it |
+| `abusech_auth_key.txt` | Free abuse.ch Auth-Key (https://auth.abuse.ch/) for the daily MalwareBazaar known-malware list | No. Leave it empty and the Hub uses only EICAR + your custom list |
 
 ## Creating them (PowerShell, from the SoC folder)
 

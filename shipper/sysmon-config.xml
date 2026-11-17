@@ -1,0 +1,116 @@
+<!--
+  Sysmon configuration for the Zero-Trust AI SOC shipper.
+  Installed by install-endpoint.ps1:  Sysmon64.exe -accepteula -i sysmon-config.xml
+  Updated with:                       Sysmon64.exe -c sysmon-config.xml
+
+  Deliberately small: only what the Hub's rules use. The shipper filters further
+  (see shipper/sysmon.py) before anything leaves the machine.
+-->
+<Sysmon schemaversion="4.90">
+  <HashAlgorithms>SHA256</HashAlgorithms>
+  <CheckRevocation>False</CheckRevocation>
+  <EventFiltering>
+
+    <!-- 1: every program launch, with SHA-256 and parent. The shipper drops routine
+         launches of installed software and keeps the risky ones. -->
+    <RuleGroup name="" groupRelation="or">
+      <ProcessCreate onmatch="exclude" />
+    </RuleGroup>
+
+    <!-- 3 / 22: network and DNS are covered by the shipper itself; keep them off. -->
+    <RuleGroup name="" groupRelation="or">
+      <NetworkConnect onmatch="include" />
+    </RuleGroup>
+    <RuleGroup name="" groupRelation="or">
+      <DnsQuery onmatch="include" />
+    </RuleGroup>
+
+    <!-- 11: files created where malware lands, and anything in a Startup folder. -->
+    <RuleGroup name="" groupRelation="or">
+      <FileCreate onmatch="include">
+        <TargetFilename condition="contains">\Downloads\</TargetFilename>
+        <TargetFilename condition="contains">\AppData\Local\Temp\</TargetFilename>
+        <TargetFilename condition="contains">\Windows\Temp\</TargetFilename>
+        <TargetFilename condition="contains">\Users\Public\</TargetFilename>
+        <TargetFilename condition="contains">\Start Menu\Programs\Startup\</TargetFilename>
+      </FileCreate>
+    </RuleGroup>
+
+    <!-- 15: browsers mark downloads with a Zone.Identifier stream; Sysmon hashes the file. -->
+    <RuleGroup name="" groupRelation="or">
+      <FileCreateStreamHash onmatch="include">
+        <TargetFilename condition="end with">:Zone.Identifier</TargetFilename>
+      </FileCreateStreamHash>
+    </RuleGroup>
+
+    <!-- 12/13/14: auto-start registry locations only. -->
+    <RuleGroup name="" groupRelation="or">
+      <RegistryEvent onmatch="include">
+        <TargetObject condition="contains">\CurrentVersion\Run</TargetObject>
+        <TargetObject condition="contains">\CurrentVersion\RunOnce</TargetObject>
+        <TargetObject condition="contains">\CurrentVersion\RunServices</TargetObject>
+        <TargetObject condition="contains">\Policies\Explorer\Run</TargetObject>
+        <TargetObject condition="contains">\Winlogon\Userinit</TargetObject>
+        <TargetObject condition="contains">\Winlogon\Shell</TargetObject>
+        <TargetObject condition="contains">\Image File Execution Options\</TargetObject>
+      </RegistryEvent>
+    </RuleGroup>
+
+    <!-- 10: something opening LSASS with rights that allow reading its memory. -->
+    <RuleGroup name="" groupRelation="or">
+      <ProcessAccess onmatch="include">
+        <Rule groupRelation="and">
+          <TargetImage condition="end with">\lsass.exe</TargetImage>
+          <GrantedAccess condition="is any">0x1010;0x1410;0x1438;0x143a;0x1f0fff;0x1f1fff;0x1f2fff;0x1f3fff;0x1fffff;0x40;0x1418;0x1038</GrantedAccess>
+        </Rule>
+      </ProcessAccess>
+    </RuleGroup>
+
+    <!-- 8: code injection via remote threads. -->
+    <RuleGroup name="" groupRelation="or">
+      <CreateRemoteThread onmatch="exclude" />
+    </RuleGroup>
+
+    <!-- 6: drivers. The shipper only forwards unsigned / invalid ones. -->
+    <RuleGroup name="" groupRelation="or">
+      <DriverLoad onmatch="exclude" />
+    </RuleGroup>
+
+    <!-- 25: process image tampering (hollowing / herpaderping). -->
+    <RuleGroup name="" groupRelation="or">
+      <ProcessTampering onmatch="exclude" />
+    </RuleGroup>
+
+    <!-- Everything else stays off. -->
+    <RuleGroup name="" groupRelation="or">
+      <ImageLoad onmatch="include" />
+    </RuleGroup>
+    <RuleGroup name="" groupRelation="or">
+      <FileDelete onmatch="include" />
+    </RuleGroup>
+    <RuleGroup name="" groupRelation="or">
+      <FileDeleteDetected onmatch="include" />
+    </RuleGroup>
+    <RuleGroup name="" groupRelation="or">
+      <PipeEvent onmatch="include" />
+    </RuleGroup>
+    <RuleGroup name="" groupRelation="or">
+      <WmiEvent onmatch="include" />
+    </RuleGroup>
+    <RuleGroup name="" groupRelation="or">
+      <ClipboardChange onmatch="include" />
+    </RuleGroup>
+    <RuleGroup name="" groupRelation="or">
+      <RawAccessRead onmatch="include" />
+    </RuleGroup>
+    <RuleGroup name="" groupRelation="or">
+      <FileBlockExecutable onmatch="include" />
+    </RuleGroup>
+    <RuleGroup name="" groupRelation="or">
+      <FileBlockShredding onmatch="include" />
+    </RuleGroup>
+    <RuleGroup name="" groupRelation="or">
+      <FileExecutableDetected onmatch="include" />
+    </RuleGroup>
+  </EventFiltering>
+</Sysmon>

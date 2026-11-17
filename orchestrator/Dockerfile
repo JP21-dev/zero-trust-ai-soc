@@ -36,4 +36,5 @@ EXPOSE 8000
 # 0.0.0.0 here is the container's own interface. What the outside world can
 # reach is decided by the host-side port binding in docker-compose.yml.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \
-     "--proxy-headers", "--no-server-header", "--log-level", "info"]
+     "--proxy-headers", "--no-server-header", "--log-level", "info", \
+     "--limit-concurrency", "100", "--timeout-keep-alive", "15"]

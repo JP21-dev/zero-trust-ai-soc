@@ -43,7 +43,7 @@ APPROVE_HTML = _HEAD.format(title="Approve action · SOC Warden") + """
   <section id="details" class="card" hidden>
     <div class="row"><span>Endpoint</span><code id="d-endpoint"></code></div>
     <div class="row"><span>Action</span><code id="d-action"></code></div>
-    <div class="row"><span>Target IP</span><code id="d-target"></code></div>
+    <div class="row"><span>Target</span><code id="d-target"></code></div>
     <div class="row"><span>Threat score</span><strong id="d-score"></strong></div>
     <div class="row"><span>Expires in</span><strong id="d-ttl"></strong></div>
     <p class="sigs-title">Why</p>
@@ -173,7 +173,8 @@ async function loadPending() {
     const p = await api("/warden/pending/" + encodeURIComponent(challengeId));
     $("d-endpoint").textContent = p.endpoint_id;
     $("d-action").textContent = p.action;
-    $("d-target").textContent = p.target_ip || "none identified";
+    $("d-target").textContent = p.action === "quarantine_file"
+      ? p.target_path + " (sha256 " + String(p.target_sha256).slice(0, 12) + "…)" : (p.target_ip || "none identified");
     $("d-score").textContent = p.threat_score + " / 100";
     const ul = $("d-sigs");
     ul.replaceChildren(...(p.attack_signatures.length ? p.attack_signatures : ["—"]).map((s) => {

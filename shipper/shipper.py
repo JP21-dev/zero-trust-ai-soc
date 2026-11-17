@@ -446,12 +446,24 @@ def run(dry_run: bool) -> None:
         sampler.previous = set()
         events = sampler.sample()
         print(json.dumps({"endpoint_id": ENDPOINT_ID, "events": events[:MAX_BATCH]}, indent=2))
-        print(f"# {len(events)} events, tailscale_up={tailscale_is_up()}", file=sys.stderr)
+        sysmon_state = "off"
+        if IS_WINDOWS and os.environ.get("SOC_SYSMON", "1") != "0":
+            from sysmon import CHANNEL, SysmonReader
+            try:
+                SysmonReader._wevtutil(["gli", CHANNEL])
+                sysmon_state = "readable"
+            except Exception:
+                sysmon_state = "unreadable"
+        print(f"# {len(events)} events, tailscale_up={tailscale_is_up()}, sysmon={sysmon_state}", file=sys.stderr)
         return
 
     token = _read_token()
     sender = Sender(token)
     enf = build_enforcer(token)
+    reader = None
+    if IS_WINDOWS and os.environ.get("SOC_SYSMON", "1") != "0":
+        from sysmon import SysmonReader
+        reader = SysmonReader(STATE_DIR, include_cmdline=INCLUDE_CMDLINE)
     lower_priority()
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
@@ -467,6 +479,8 @@ def run(dry_run: bool) -> None:
     next_tick = time.monotonic()
     while not stop.is_set():
         events = sampler.sample()
+        if reader is not None and cycle % 2 == 0:   # Sysmon every ~20 s
+            events += reader.read()
         if events:
             sender.enqueue(events)
         sender.flush()
@@ -506,10 +520,26 @@ def main() -> None:
     parser.add_argument("--list-blocks", action="store_true",
                         help="list firewall blocks applied by this enforcer")
     parser.add_argument("--unblock", metavar="IP", help="remove SOC-Warden firewall rules for IP")
+    parser.add_argument("--list-quarantine", action="store_true", help="list files this enforcer quarantined")
+    parser.add_argument("--restore", metavar="SHA256_PREFIX", help="put a quarantined file back where it was")
     args = parser.parse_args()
     logging.basicConfig(level=os.environ.get("SOC_LOG_LEVEL", "INFO"),
                         format="%(asctime)s %(levelname)s %(message)s")
 
+    if args.list_quarantine or args.restore:
+        import enforcer
+        if args.list_quarantine:
+            items = enforcer.list_quarantine(STATE_DIR)
+            for q in items:
+                print(f"{q['sha256'][:16]}…  {q['quarantined_at']}  {q['original_path']}  "
+                      f"(approved by {q.get('approved_by')}, score {q.get('threat_score')})")
+            print(f"{len(items)} quarantined file(s)")
+        else:
+            try:
+                print("restored to", enforcer.restore(STATE_DIR, args.restore))
+            except enforcer.QuarantineError as exc:
+                sys.exit(f"not restored: {exc}")
+        return
     if args.pin_hub_key or args.list_blocks or args.unblock:
         import enforcer
         if args.pin_hub_key:

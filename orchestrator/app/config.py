@@ -58,6 +58,18 @@ class Settings(BaseSettings):
     endpoint_unknown_alert_seconds: int = Field(default=900, ge=60, le=86400)
     # Presence reports older than this are ignored.
     presence_max_age_seconds: int = Field(default=300, ge=60, le=3600)
+    # Known-malware fingerprints: download abuse.ch MalwareBazaar's "recent" list daily.
+    # Download only; nothing about your machines is sent. Custom hashes: <data>/intel/custom_sha256.txt
+    intel_feed_enabled: bool = True
+    abusech_auth_key_file: Path = Path("/run/secrets/abusech_auth_key")
+    # Per-endpoint tokens: when true, the shared shipper token is refused and every
+    # endpoint must use its own token (python -m app.tokens issue <endpoint_id>).
+    strict_endpoint_tokens: bool = False
+
+    @property
+    def abusech_auth_key(self) -> str | None:
+        s = _read_secret(self.abusech_auth_key_file)
+        return s.get_secret_value() if s else None
 
     gemini_api_key_file: str | None = None
     discord_webhook_url_file: str | None = None

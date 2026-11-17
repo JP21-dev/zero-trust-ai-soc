@@ -65,12 +65,17 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from app import dashboard_auth, dashboard_ui, passkeys, testlab, warden_ui
+from app import dashboard_auth, dashboard_ui, passkeys, testlab, tokens, warden_ui
 from app.activity import Activity
+from app.audit import AuditLog
+from app.intel import Intel
 from app.config import get_settings
 
 settings = get_settings()
 activity = Activity(Path(settings.warden_data_dir) / "activity.jsonl")
+intel = Intel(Path(settings.warden_data_dir))
+audit = AuditLog(Path(settings.warden_data_dir) / "audit.jsonl")
+activity.audit = audit
 logging.basicConfig(
     level=settings.log_level,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -90,7 +95,8 @@ class SOCState(TypedDict, total=False):
     injection_flags: list[dict[str, Any]]       # prompt-injection hits (what, where)
     redteam_audit: list[dict[str, Any]]         # identity-spoof / masquerade findings
     enrichment_notes: list[dict[str, Any]]      # ChromaDB fingerprint results
-    behavior_findings: list[dict[str, Any]]     # built-in malware-behavior rules, per connection
+    behavior_findings: list[dict[str, Any]]     # built-in malware-behavior rules, per event
+    target_file: dict[str, str] | None          # {"path", "sha256"} the Warden may quarantine
     heuristic_score: int                        # deterministic floor, 0-100
     threat_score: int                           # final score, 0-100
     attack_signatures: list[str]
@@ -114,6 +120,13 @@ class TelemetryEvent(BaseModel):
     model_config = ConfigDict(extra="forbid", str_max_length=4096)
 
     timestamp: datetime
+    # "connection" (the shipper's own sampling) or a Sysmon-derived event:
+    #   process   a program started (Sysmon 1)        file      a file was created (11, 15)
+    #   registry  an auto-start key was set (12-14)    lsass     something opened LSASS (10)
+    #   injection code injected into another process (8)
+    #   driver    a driver loaded (6)                  tamper    process image tampering (25)
+    event_type: Literal["connection", "process", "file", "registry", "lsass", "injection",
+                        "driver", "tamper"] = "connection"
     process_name: str = Field(min_length=1, max_length=260)
     pid: int | None = Field(default=None, ge=0)
     exe_path: str | None = Field(default=None, max_length=1024)
@@ -122,6 +135,23 @@ class TelemetryEvent(BaseModel):
     dst_ip: str | None = None
     dst_port: int | None = Field(default=None, ge=0, le=65535)
     protocol: Literal["tcp", "udp", "icmp", "other"] | None = None
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
+    parent_name: str | None = Field(default=None, max_length=260)
+    parent_path: str | None = Field(default=None, max_length=1024)
+    parent_cmdline: str | None = None
+    file_path: str | None = Field(default=None, max_length=1024)     # file/driver events
+    reg_key: str | None = Field(default=None, max_length=1024)
+    reg_value: str | None = Field(default=None, max_length=2048)
+    target_process: str | None = Field(default=None, max_length=1024)  # lsass/injection target
+    granted_access: str | None = Field(default=None, max_length=32)
+    signed: bool | None = None
+    signer: str | None = Field(default=None, max_length=256)
+    rule: str | None = Field(default=None, max_length=128)             # Sysmon RuleName
+
+    @field_validator("sha256")
+    @classmethod
+    def _lower_hash(cls, v: str | None) -> str | None:
+        return v.lower() if v else v
 
     @field_validator("dst_ip")
     @classmethod
@@ -165,7 +195,8 @@ SAFE_PROCESSES: dict[str, tuple[str, ...]] = {
     "tailscaled.exe": ("c:\\program files\\tailscale\\",),
 }
 
-TEXT_FIELDS = ("process_name", "exe_path", "user", "cmdline")
+TEXT_FIELDS = ("process_name", "exe_path", "user", "cmdline", "parent_name", "parent_path",
+               "parent_cmdline", "file_path", "reg_key", "reg_value", "target_process", "signer", "rule")
 REDACTION = "[REDACTED:prompt-injection]"
 
 _ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u200e\u200f\u2060\ufeff\u00ad"), None)
@@ -261,7 +292,9 @@ async def gatekeeper_node(state: SOCState) -> dict[str, Any]:
         event = dict(raw)
 
         drop, masquerade = _is_known_safe(event)
-        if drop:
+        # Only a connection or launch BY a known-safe app is dropped. A file Chrome
+        # downloaded, or a registry key Steam set, is still worth a look.
+        if drop and event.get("event_type", "connection") in ("connection", "process"):
             dropped += 1
             continue
         if masquerade:
@@ -342,12 +375,36 @@ NOVELTY_DISTANCE = 1.0   # L2 distance (not squared) at which anomaly_score hits
 SEEN_EPSILON = 1e-6
 
 
+NON_CONNECTION_FP = ("run:", "file:", "reg:", "lsass:", "inject:", "driver:", "tamper:")
+
+
 def fingerprint(endpoint_id: str, event: dict[str, Any]) -> str | None:
-    if not event.get("dst_ip"):
-        return None
-    port = event.get("dst_port")
-    port_s = str(port) if port is not None else "*"
-    return f"{endpoint_id}|{_basename(event['process_name'])}->{event['dst_ip']}:{port_s}"
+    """What the Detective remembers. Connections: process->ip:port. Sysmon events:
+    the program (by hash when known), the file, the auto-start entry, etc."""
+    et = event.get("event_type") or "connection"
+    name = _basename(event["process_name"])
+    sha = (event.get("sha256") or "")[:16]
+    if et == "connection":
+        if not event.get("dst_ip"):
+            return None
+        port = event.get("dst_port")
+        port_s = str(port) if port is not None else "*"
+        return f"{endpoint_id}|{name}->{event['dst_ip']}:{port_s}"
+    if et == "process":
+        who = f"{name}#{sha}" if sha else (event.get("exe_path") or name).lower()
+        return f"{endpoint_id}|run:{who}<-{_basename(event.get('parent_name') or '?')}"
+    if et in ("file", "driver"):
+        f = event.get("file_path") or ""
+        return f"{endpoint_id}|{'file' if et == 'file' else 'driver'}:{_basename(f)}#{sha or f.lower()}"
+    if et == "registry":
+        return f"{endpoint_id}|reg:{(event.get('reg_key') or '').lower()}={(event.get('reg_value') or '')[:120].lower()}"
+    if et == "injection":
+        return f"{endpoint_id}|inject:{name}->{_basename(event.get('target_process') or '?')}"
+    return f"{endpoint_id}|{et}:{name}"
+
+
+def _is_connection_fp(fp: str) -> bool:
+    return not fp.split("|", 1)[-1].startswith(NON_CONNECTION_FP)
 
 
 def embed_fingerprint(fp: str) -> list[float]:
@@ -501,41 +558,122 @@ OBFUSCATION: list[tuple[str, re.Pattern[str]]] = [
     ("rundll32 script", re.compile(r"rundll32(?:\.exe)?\b.*javascript:", re.I)),
 ]
 RAW_IP_URL = re.compile(r"\bhttps?://\d{1,3}(?:\.\d{1,3}){3}\b", re.I)
-BEHAVIOR_POINTS = {"suspicious_location": 35, "attacker_port": 30, "lolbin_network": 20,
-                   "obfuscated_command": 45, "raw_ip_download": 20}
+OFFICE_APPS = {"winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "onenote.exe", "msaccess.exe",
+               "mspub.exe", "visio.exe", "acrord32.exe", "acrobat.exe"}
+SCRIPT_HOSTS = LOLBINS | {"wscript.exe", "cscript.exe", "python.exe", "pythonw.exe", "node.exe", "java.exe",
+                          "javaw.exe", "bash.exe", "wsl.exe"}
+RUNNABLE_EXT = re.compile(r"\.(exe|dll|scr|com|pif|msi|msp|ps1|psm1|vbs|vbe|js|jse|wsf|hta|bat|cmd|lnk|jar|cpl|iso|img)$", re.I)
+DOUBLE_EXT = re.compile(r"\.(pdf|docx?|xlsx?|pptx?|txt|jpe?g|png|gif|zip|rar|mp3|mp4|csv|rtf)\s*\.(exe|scr|com|pif|bat|cmd|js|vbs|hta|lnk|msi)$", re.I)
+STARTUP_DIR = re.compile(r"\\(?:start menu\\programs\\startup|startup)\\", re.I)
+RUN_KEY = re.compile(r"\\(?:currentversion\\(?:run|runonce|runservices|policies\\explorer\\run)|"
+                     r"winlogon\\(?:userinit|shell)|image file execution options\\[^\\]+\\debugger)(?:\\|$)", re.I)
+BEHAVIOR_POINTS = {
+    "known_malware": 90, "suspicious_location": 35, "attacker_port": 30, "lolbin_network": 20,
+    "obfuscated_command": 45, "raw_ip_download": 20, "office_child": 45, "double_extension": 35,
+    "startup_persistence": 40, "dropped_runnable": 15, "credential_theft": 70, "code_injection": 50,
+    "unsigned_driver": 50, "process_tamper": 50,
+}
 BEHAVIOR_LABELS = {
-    "suspicious_location": "program running from a Temp/Downloads/Public folder",
+    "known_malware": "matches a known-malware fingerprint",
+    "suspicious_location": "running from or dropped in a Temp/Downloads/Public folder",
     "attacker_port": "connection to a port attackers commonly use",
     "lolbin_network": "Windows admin tool talking to the internet",
     "obfuscated_command": "hidden or encoded command line",
     "raw_ip_download": "command line fetches from a bare IP address",
+    "office_child": "an Office/PDF app launched a script or admin tool",
+    "double_extension": "file disguised with a double extension",
+    "startup_persistence": "set itself to start automatically",
+    "dropped_runnable": "new program or script file",
+    "credential_theft": "tried to read passwords from LSASS",
+    "code_injection": "injected code into another process",
+    "unsigned_driver": "loaded an unsigned driver",
+    "process_tamper": "tampered with a running process's image",
 }
 
 
+def _subject_path(e: dict[str, Any]) -> str:
+    """The file a finding is about: the dropped/loaded file, or the program itself."""
+    if e.get("event_type") in ("file", "driver"):
+        return (e.get("file_path") or "").replace("/", "\\")
+    return (e.get("exe_path") or "").replace("/", "\\")
+
+
 def behavior_findings(endpoint_id: str, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Per-connection red flags from the built-in rules. Only flagged connections are returned."""
+    """Per-event red flags from the built-in rules. Only flagged events are returned."""
     out = []
     for idx, e in enumerate(events):
-        path = (e.get("exe_path") or "").replace("/", "\\")
+        et = e.get("event_type") or "connection"
+        path = _subject_path(e)
         cmd = e.get("cmdline") or ""
         name = _basename(e["process_name"])
         flags: dict[str, str] = {}
+        if (hit := intel.lookup(e.get("sha256"))):
+            flags["known_malware"] = f"{hit['label']} ({hit['source']})"
         if path and SUSPICIOUS_DIR.search(path):
             flags["suspicious_location"] = path[:160]
-        if e.get("dst_port") in ATTACKER_PORTS:
-            flags["attacker_port"] = f"port {e['dst_port']}"
-        if name in LOLBINS and e.get("dst_ip"):
-            flags["lolbin_network"] = name
-        obf = [label for label, p in OBFUSCATION if p.search(cmd)]
-        if obf:
-            flags["obfuscated_command"] = ", ".join(obf)
-        if RAW_IP_URL.search(cmd):
-            flags["raw_ip_download"] = RAW_IP_URL.search(cmd).group(0)
+        if et == "connection":
+            if e.get("dst_port") in ATTACKER_PORTS:
+                flags["attacker_port"] = f"port {e['dst_port']}"
+            if name in LOLBINS and e.get("dst_ip"):
+                flags["lolbin_network"] = name
+        if et in ("connection", "process"):
+            obf = [label for label, p in OBFUSCATION if p.search(cmd)]
+            if obf:
+                flags["obfuscated_command"] = ", ".join(obf)
+            if RAW_IP_URL.search(cmd):
+                flags["raw_ip_download"] = RAW_IP_URL.search(cmd).group(0)
+        if et == "process" and _basename(e.get("parent_name") or "") in OFFICE_APPS and name in SCRIPT_HOSTS:
+            flags["office_child"] = f"{_basename(e.get('parent_name') or '')} → {name}"
+        if path and DOUBLE_EXT.search(path):
+            flags["double_extension"] = _basename(path)
+        if et == "file":
+            if STARTUP_DIR.search(path):
+                flags["startup_persistence"] = "Startup folder"
+            if RUNNABLE_EXT.search(path) and (SUSPICIOUS_DIR.search(path) or STARTUP_DIR.search(path)):
+                flags["dropped_runnable"] = _basename(path)
+        if et == "registry" and RUN_KEY.search(e.get("reg_key") or ""):
+            flags["startup_persistence"] = (e.get("reg_key") or "")[-100:]
+            val = (e.get("reg_value") or "").replace("/", "\\")
+            if SUSPICIOUS_DIR.search(val):
+                flags["suspicious_location"] = val[:160]
+        if et == "lsass":
+            flags["credential_theft"] = f"{name} opened lsass.exe (access {e.get('granted_access') or '?'})"
+        if et == "injection":
+            flags["code_injection"] = f"{name} → {_basename(e.get('target_process') or '?')}"
+        if et == "driver" and e.get("signed") is False:
+            flags["unsigned_driver"] = _basename(path) or name
+        if et == "tamper":
+            flags["process_tamper"] = name
         if flags:
-            out.append({"event_index": idx, "process": name, "dst_ip": e.get("dst_ip"),
-                        "dst_port": e.get("dst_port"), "fingerprint": fingerprint(endpoint_id, e),
+            out.append({"event_index": idx, "event_type": et, "process": name, "dst_ip": e.get("dst_ip"),
+                        "dst_port": e.get("dst_port"), "path": path or None, "sha256": e.get("sha256"),
+                        "fingerprint": fingerprint(endpoint_id, e),
                         "flags": flags, "points": sum(BEHAVIOR_POINTS[f] for f in flags)})
     return sorted(out, key=lambda f: f["points"], reverse=True)
+
+
+HUB_PROTECTED_ROOTS = ("c:\\windows\\", "c:\\program files\\", "c:\\program files (x86)\\",
+                       "c:\\programdata\\microsoft\\", "c:\\socshipper\\", "c:\\programdata\\socshipper\\")
+
+
+def quarantinable(path: str | None, sha: str | None) -> bool:
+    """Mirror of the enforcer's policy, so the Warden never proposes an impossible quarantine."""
+    if not path or not sha or not re.match(r"^[A-Za-z]:\\", path) or ".." in path.split("\\"):
+        return False
+    low = path.lower()
+    return not any(low.startswith(r) for r in HUB_PROTECTED_ROOTS)
+
+
+def _best_file_target(state: SOCState, score: int) -> dict[str, str] | None:
+    """The file to quarantine: a known-malware match first, else the worst flagged file/program."""
+    if score < settings.warden_threat_threshold:
+        return None
+    findings = [f for f in state.get("behavior_findings") or []
+                if f.get("event_type") != "connection" and quarantinable(f.get("path"), f.get("sha256"))]
+    findings.sort(key=lambda f: ("known_malware" not in f["flags"], -f["points"]))
+    if not findings:
+        return None
+    return {"path": findings[0]["path"], "sha256": findings[0]["sha256"].lower()}
 
 
 def heuristic_score(state: SOCState) -> int:
@@ -585,7 +723,8 @@ def _best_local_target(state: SOCState, score: int) -> str | None:
     for f in state.get("behavior_findings") or []:
         if (ip := _validate_target(f.get("dst_ip"), state)):
             return ip
-    novel = [n for n in state.get("enrichment_notes") or [] if not n["seen_before"]]
+    novel = [n for n in state.get("enrichment_notes") or []
+             if not n["seen_before"] and _is_connection_fp(n["fingerprint"])]
     if not novel:
         return None
     top = max(novel, key=lambda n: n["anomaly_score"])
@@ -650,7 +789,7 @@ async def strategist_node(state: SOCState) -> dict[str, Any]:
     if key is None:
         return {"heuristic_score": floor, "threat_score": floor, "attack_signatures": signatures,
                 "target_ip": _best_local_target(state, floor), "llm_status": "no_api_key",
-                "behavior_findings": behavior}
+                "behavior_findings": behavior, "target_file": _best_file_target(state, floor)}
 
     try:
         verdict = await _call_gemini(state, key.get_secret_value())
@@ -668,13 +807,14 @@ async def strategist_node(state: SOCState) -> dict[str, Any]:
         return {"heuristic_score": floor, "threat_score": final, "attack_signatures": signatures,
                 "target_ip": (_validate_target(verdict.target_ip, state)
                               or _best_local_target(state, final)),
-                "llm_status": "ok", "behavior_findings": behavior}
+                "llm_status": "ok", "behavior_findings": behavior,
+                "target_file": _best_file_target(state, final)}
 
     log.warning("strategist endpoint=%s gemini failed (%s), using heuristic=%d",
                 state["endpoint_id"], status_txt, floor)
     return {"heuristic_score": floor, "threat_score": floor, "attack_signatures": signatures,
             "target_ip": _best_local_target(state, floor), "llm_status": status_txt,
-            "behavior_findings": behavior}
+            "behavior_findings": behavior, "target_file": _best_file_target(state, floor)}
 
 
 # =============================================================================
@@ -691,13 +831,46 @@ class PendingAction:
     created_at: float
     expires_at: float
     hmac_sha256: str
+    target_path: str | None = None      # quarantine_file only
+    target_sha256: str | None = None
+
+    @property
+    def target_key(self) -> str | None:
+        return self.target_sha256 if self.action == "quarantine_file" else self.target_ip
+
+    @property
+    def target_text(self) -> str:
+        if self.action == "quarantine_file":
+            return f"{self.target_path} (sha256 {str(self.target_sha256)[:12]}…)"
+        return self.target_ip or "none identified"
 
     def signing_payload(self) -> bytes:
         return _canonical({
             "challenge_id": self.challenge_id, "endpoint_id": self.endpoint_id,
             "action": self.action, "target_ip": self.target_ip,
+            "target_path": self.target_path, "target_sha256": self.target_sha256,
             "threat_score": self.threat_score, "expires_at": int(self.expires_at),
         })
+
+
+def _order_target_text(o: dict[str, Any]) -> str:
+    """Human-readable target of a signed order (dict) or its record."""
+    if o.get("action") == "quarantine_file":
+        return f"{o.get('target_path')} (sha256 {str(o.get('target_sha256'))[:12]}…)"
+    return o.get("target_ip") or "none"
+
+
+def _choose_action(state: SOCState) -> tuple[str, str | None, dict[str, str] | None]:
+    """Known malware on disk -> quarantine it. Else block the attacker IP if there is one,
+    else quarantine the worst flagged file, else ask for a manual review."""
+    ip, tf = state.get("target_ip"), state.get("target_file")
+    known = tf and any("known_malware" in f["flags"] and (f.get("sha256") or "").lower() == tf["sha256"]
+                       for f in state.get("behavior_findings") or [])
+    if tf and (known or not ip):
+        return "quarantine_file", None, tf
+    if ip:
+        return "block_ip", ip, None
+    return "isolate_review", None, None
 
 
 PENDING: dict[str, PendingAction] = {}
@@ -739,9 +912,9 @@ async def _purge_expired() -> None:
         for cid in [c for c, a in PENDING.items() if a.expires_at <= now]:
             a = PENDING.pop(cid)
             log.warning("warden: challenge %s… expired, auto-denied (target=%s score=%d)",
-                        cid[:8], a.target_ip, a.threat_score)
+                        cid[:8], a.target_text, a.threat_score)
             activity.record("challenge_expired", endpoint_id=a.endpoint_id, challenge=cid[:8],
-                            target_ip=a.target_ip, threat_score=a.threat_score,
+                            target_ip=a.target_ip, target_path=a.target_path, threat_score=a.threat_score,
                             test=a.endpoint_id == testlab.TEST_ENDPOINT)
             _test_followup(cid, "expired", "approval window ran out; auto-denied")
             if a.endpoint_id == testlab.TEST_ENDPOINT:
@@ -759,13 +932,13 @@ async def _purge_expired() -> None:
         log.warning("warden: order %s for %s EXPIRED UNENFORCED (endpoint offline?)",
                     o["order_id"], o["endpoint_id"])
         activity.record("order_expired", endpoint_id=o["endpoint_id"], order_id=o["order_id"],
-                        target_ip=o["target_ip"], action=o["action"],
+                        target_ip=o["target_ip"], target_path=o.get("target_path"), action=o["action"],
                         test=o["endpoint_id"] == testlab.TEST_ENDPOINT)
         _test_followup(o["challenge_id"], "order_expired", "no enforcer picked the order up")
         await _post_discord({"embeds": [{
             "title": "⚠️ Approved order expired without being enforced",
             "color": 0xF59E0B,
-            "description": (f"`{o['action']}` on `{o['target_ip'] or 'none'}` for "
+            "description": (f"`{o['action']}` on `{_safe_md(_order_target_text(o), 300)}` for "
                             f"`{o['endpoint_id']}` was never picked up. The endpoint may be "
                             "offline or off the tailnet. Nothing was blocked."),
         }]}, "expiry notice")
@@ -800,7 +973,7 @@ async def _send_discord_alert(action: PendingAction, state: SOCState) -> bool:
         {"name": "Endpoint", "value": f"`{action.endpoint_id}`", "inline": True},
         {"name": "Threat score", "value": f"**{action.threat_score}**/100", "inline": True},
         {"name": "Proposed action", "value": f"`{action.action}`", "inline": True},
-        {"name": "Target IP", "value": f"`{action.target_ip or 'none identified'}`", "inline": True},
+        {"name": "Target", "value": f"`{_safe_md(action.target_text, 300)}`", "inline": True},
         {"name": "Expires", "value": f"<t:{int(action.expires_at)}:R> ({ttl}s)", "inline": True},
         {"name": "LLM status", "value": f"`{state.get('llm_status', '?')}`", "inline": True},
         {"name": "Attack signatures", "value": sigs[:1024], "inline": False},
@@ -873,11 +1046,11 @@ async def warden_node(state: SOCState) -> dict[str, Any]:
     now = time.time()
     # Malware beacons over and over. One open approval per (endpoint, target, action)
     # is enough; and after you deny one, don't nag about it again for a while.
-    key = (state["endpoint_id"], state.get("target_ip"),
-           "block_ip" if state.get("target_ip") else "isolate_review")
+    act, ip, tf = _choose_action(state)
+    key = (state["endpoint_id"], tf["sha256"] if tf else ip, act)
     async with PENDING_LOCK:
         dup = next((a for a in PENDING.values()
-                    if (a.endpoint_id, a.target_ip, a.action) == key and a.expires_at > now), None)
+                    if (a.endpoint_id, a.target_key, a.action) == key and a.expires_at > now), None)
     if dup is not None:
         log.info("warden: score %d for %s, approval %s… already pending; not re-alerting",
                  score, key[1], dup.challenge_id[:8])
@@ -888,11 +1061,10 @@ async def warden_node(state: SOCState) -> dict[str, Any]:
     cid = secrets.token_urlsafe(32)
     unsigned = PendingAction(
         challenge_id=cid, endpoint_id=state["endpoint_id"],
-        action="block_ip" if state.get("target_ip") else "isolate_review",
-        target_ip=state.get("target_ip"), threat_score=score,
+        action=act, target_ip=ip, threat_score=score,
         attack_signatures=tuple(state.get("attack_signatures") or []),
         created_at=now, expires_at=now + settings.warden_approval_timeout_seconds,
-        hmac_sha256="",
+        hmac_sha256="", target_path=tf["path"] if tf else None, target_sha256=tf["sha256"] if tf else None,
     )
     action = replace(unsigned, hmac_sha256=sign_action(
         secret.get_secret_value().encode(), unsigned.signing_payload()))
@@ -906,10 +1078,12 @@ async def warden_node(state: SOCState) -> dict[str, Any]:
 
     quiet = bool(state.get("test") and state.get("test_quiet"))
     alerted = None if quiet else await _send_discord_alert(action, state)
-    log.warning("warden: ESCALATED endpoint=%s score=%d target=%s challenge=%s… discord=%s",
-                action.endpoint_id, score, action.target_ip, cid[:8], "skipped (quiet test)" if quiet else alerted)
+    log.warning("warden: ESCALATED endpoint=%s score=%d %s %s challenge=%s… discord=%s",
+                action.endpoint_id, score, action.action, action.target_text, cid[:8],
+                "skipped (quiet test)" if quiet else alerted)
     activity.record("escalated", endpoint_id=action.endpoint_id, challenge=cid[:8],
-                    action=action.action, target_ip=action.target_ip, threat_score=score,
+                    action=action.action, target_ip=action.target_ip, target_path=action.target_path,
+                    target_sha256=action.target_sha256, threat_score=score,
                     signatures=[s[:200] for s in action.attack_signatures[:5]],
                     discord=alerted, test=bool(state.get("test")))
     return {"challenge_ids": [cid],
@@ -962,6 +1136,8 @@ def _trace_strategist(state: SOCState, out: dict[str, Any]) -> dict[str, Any]:
         summary += ": " + "; ".join(out["attack_signatures"][:3])
     if out.get("target_ip"):
         summary += f". Suggested block: {out['target_ip']}"
+    if out.get("target_file"):
+        summary += f". Suggested quarantine: {out['target_file']['path']}"
     thr = settings.warden_threat_threshold
     return {"status": "crit" if score >= thr else "warn" if score >= 50 else "ok", "summary": summary,
             "stats": {"score": score, "floor": floor, "llm": llm}}
@@ -975,8 +1151,8 @@ def _trace_warden(state: SOCState, out: dict[str, Any]) -> dict[str, Any]:
                 " (Discord alert FAILED to send)" if d.endswith("alert_failed") else " (Discord alert sent)")
         return {"status": "crit", "stats": {"escalated": 1},
                 "summary": (f"Score {score} ≥ {thr}: paused and asked for your passkey to approve "
-                            f"{'block_ip ' + state['target_ip'] if state.get('target_ip') else 'a review'}" + note)}
-    target = state.get("target_ip") or "this endpoint"
+                            f"{_plan_text(state)}" + note)}
+    target = _plan_text(state, short=True)
     if out.get("decision") == "already_pending":
         return {"status": "warn", "stats": {}, "summary": (
             f"Score {score} ≥ {thr}, but an approval for {target} is already waiting for you: not alerting again")}
@@ -993,6 +1169,15 @@ def _trace_warden(state: SOCState, out: dict[str, Any]) -> dict[str, Any]:
                 "summary": f"Score {score} is below {thr}: logged{learned}", "stats": {}}
     return {"status": "warn", "stats": {},
             "summary": f"Score {score} is below {thr}: logged, but too suspicious to learn as normal"}
+
+
+def _plan_text(state: SOCState, short: bool = False) -> str:
+    act, ip, tf = _choose_action(state)
+    if act == "quarantine_file":
+        return tf["path"] if short else f"quarantining {tf['path']}"
+    if act == "block_ip":
+        return ip if short else f"block_ip {ip}"
+    return "this endpoint" if short else "a manual review"
 
 
 def _traced(agent: str, fn, describe):
@@ -1147,6 +1332,8 @@ def sign_execution_order(action: PendingAction, approval: dict[str, Any]) -> Exe
         "endpoint_id": action.endpoint_id,
         "action": action.action,
         "target_ip": action.target_ip,
+        "target_path": action.target_path,
+        "target_sha256": action.target_sha256,
         "threat_score": action.threat_score,
         "approved_at": now,
         "not_before": now,
@@ -1167,7 +1354,7 @@ async def _send_discord_approval(order: dict[str, Any]) -> None:
         "fields": [
             {"name": "Endpoint", "value": f"`{order['endpoint_id']}`", "inline": True},
             {"name": "Action", "value": f"`{order['action']}`", "inline": True},
-            {"name": "Target IP", "value": f"`{order['target_ip'] or 'none'}`", "inline": True},
+            {"name": "Target", "value": f"`{_safe_md(_order_target_text(order), 300)}`", "inline": True},
             {"name": "Approval", "value": f"`{order['approval']['method']}`", "inline": True},
             {"name": "Order valid until", "value": f"<t:{order['expires_at']}:T>", "inline": True},
         ],
@@ -1196,6 +1383,38 @@ def _load_execution_key() -> None:
 # FastAPI
 # =============================================================================
 MAX_BODY_BYTES = 2 * 1024 * 1024
+
+
+async def _intel_loop() -> None:
+    """Housekeeping: audit-chain alert + checkpoint at startup and daily; refresh the
+    known-malware fingerprint feed at startup (if stale) and then daily."""
+    last_checkpoint = 0.0
+    st = audit.status()
+    if not st["verified"]:
+        activity.record("audit_broken", broken_at=st["broken_at"], entries=st["entries"])
+        await _post_discord({"embeds": [{
+            "title": "🚨 Audit log tampered with",
+            "color": 0xDC2626,
+            "description": (f"The Hub's hash-chained audit log fails verification at entry **{st['broken_at']}** "
+                            f"of {st['entries']}. Entries were changed, removed or reordered. Compare with the "
+                            "📜 checkpoints in this channel to see when."),
+        }]}, "audit alert")
+    while True:
+        if time.time() - last_checkpoint >= 86400:
+            st = audit.status()
+            if await _post_discord({"embeds": [{
+                "title": f"📜 Audit checkpoint: {st['entries']} entries",
+                "color": 0x8B5CF6,
+                "description": (f"Head hash `{st['head'][:32]}`\n"
+                                + ("Chain verified." if st["verified"] else f"⚠️ Chain broken at entry {st['broken_at']}.")
+                                + " If the Hub's history is ever rewritten, it won't match these messages."),
+            }]}, "audit checkpoint"):
+                last_checkpoint = time.time()
+        if settings.intel_feed_enabled and (intel.last_update is None or time.time() - intel.last_update > 20 * 3600):
+            await intel.refresh(rt.http, settings.abusech_auth_key)
+        else:
+            intel._load_custom()   # pick up edits to the custom list
+        await asyncio.sleep(3600)
 
 
 async def _purge_loop() -> None:
@@ -1234,6 +1453,8 @@ async def lifespan(_: FastAPI):
                         "soc-orchestrator python -m app.passkeys enroll-code")
 
     await asyncio.to_thread(activity.load)
+    await asyncio.to_thread(audit.verify)
+    await asyncio.to_thread(intel.load)
     activity.record("hub_started", key_id=rt.exec_key_id,
                     passkeys=len(passkeys.list_credentials()),
                     gemini=settings.gemini_api_key is not None)
@@ -1246,10 +1467,12 @@ async def lifespan(_: FastAPI):
                     type(exc).__name__)
         rt.collection = None
     purger = asyncio.create_task(_purge_loop())
+    intel_task = asyncio.create_task(_intel_loop())
     try:
         yield
     finally:
         purger.cancel()
+        intel_task.cancel()
         await rt.http.aclose()
 
 
@@ -1263,20 +1486,64 @@ app = FastAPI(
 )
 
 
-async def require_shipper(request: Request, x_soc_token: str | None = Header(default=None)) -> None:
+@dataclass(frozen=True)
+class ShipperIdentity:
+    """Who's calling. endpoint=None means the old shared token (any endpoint name)."""
+    kind: Literal["endpoint", "shared"]
+    endpoint: str | None = None
+
+    def check(self, endpoint_id: str) -> None:
+        """A per-endpoint token may only speak for its own endpoint."""
+        if self.endpoint is not None and self.endpoint != endpoint_id.lower():
+            log.warning("auth: token for %s tried to act as %s", self.endpoint, endpoint_id)
+            raise HTTPException(status.HTTP_403_FORBIDDEN, f"this token belongs to {self.endpoint}")
+        TOKEN_KIND[endpoint_id.lower()] = self.kind
+
+
+TOKEN_KIND: dict[str, str] = {}   # endpoint -> "endpoint" | "shared", for the dashboard
+
+
+async def require_shipper(request: Request, x_soc_token: str | None = Header(default=None)) -> ShipperIdentity:
     """For POSTs with a body: size limit, then token."""
     length = request.headers.get("content-length")
     if length is None or not length.isdigit() or int(length) > MAX_BODY_BYTES:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                             "Content-Length required, max 2 MiB")
-    await require_shipper_token(x_soc_token)
+    return await require_shipper_token(x_soc_token)
 
 
-async def require_shipper_token(x_soc_token: str | None = Header(default=None)) -> None:
-    token = settings.shipper_token
+async def require_shipper_token(x_soc_token: str | None = Header(default=None)) -> ShipperIdentity:
     presented = x_soc_token or ""
-    if token is None or not hmac.compare_digest(presented.encode(), token.get_secret_value().encode()):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid X-SOC-Token")
+    if (ep := tokens.endpoint_of(presented)):
+        return ShipperIdentity("endpoint", ep)
+    token = settings.shipper_token
+    if token is not None and hmac.compare_digest(presented.encode(), token.get_secret_value().encode()):
+        if settings.strict_endpoint_tokens:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED,
+                                "the shared token is disabled; use this endpoint's own token")
+        return ShipperIdentity("shared")
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid X-SOC-Token")
+
+
+# ---- rate limits: a compromised or buggy endpoint can't flood the Hub ----
+_BUCKETS: dict[str, list[float]] = {}   # key -> [tokens, last_refill]
+RATE_LIMITS = {   # route: (per-minute rate, burst). Normal shippers use a fraction of these.
+    "ingest": (30, 30), "orders": (30, 20), "ack": (30, 20), "presence": (6, 4),
+}
+
+
+def rate_limit(route: str, who: str) -> None:
+    rate, burst = RATE_LIMITS[route]
+    now = time.monotonic()
+    for key, r, b in ((f"{route}|{who}", rate, burst), (f"{route}|*", rate * 10, burst * 10)):
+        tok, last = _BUCKETS.get(key, [b, now])
+        tok = min(b, tok + (now - last) * r / 60)
+        if tok < 1:
+            log.warning("rate limit: %s for %s exceeded", route, who if key.endswith(who) else "all endpoints")
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "slow down")
+        _BUCKETS[key] = [tok - 1, now]
+    if len(_BUCKETS) > 5000:
+        _BUCKETS.clear()
 
 
 async def run_pipeline(endpoint_id: str, raw: list[dict[str, Any]], test: bool = False,
@@ -1300,17 +1567,19 @@ async def run_pipeline(endpoint_id: str, raw: list[dict[str, Any]], test: bool =
                          for n in notes if not n["seen_before"]][:12],
         score=final.get("threat_score", 0), heuristic=final.get("heuristic_score", 0),
         llm_status=final.get("llm_status", "skipped"), decision=final.get("decision", "unknown"),
-        target_ip=final.get("target_ip"),
+        target_ip=final.get("target_ip"), target_file=(final.get("target_file") or {}).get("path"),
         signatures=[s[:200] for s in (final.get("attack_signatures") or [])[:5]],
         trace=[{**t, "summary": str(t.get("summary", ""))[:400]} for t in final.get("trace") or []],
     )
     return final
 
 
-@app.post("/ingest", response_model=IngestResult, dependencies=[Depends(require_shipper)])
-async def ingest(batch: IngestBatch) -> IngestResult:
+@app.post("/ingest", response_model=IngestResult)
+async def ingest(batch: IngestBatch, ident: ShipperIdentity = Depends(require_shipper)) -> IngestResult:
     if batch.endpoint_id == testlab.TEST_ENDPOINT:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "endpoint_id is reserved for the dashboard test lab")
+    ident.check(batch.endpoint_id)
+    rate_limit("ingest", batch.endpoint_id.lower())
     raw = [e.model_dump(mode="json") for e in batch.events]
     final = await run_pipeline(batch.endpoint_id, raw)
     return IngestResult(
@@ -1348,7 +1617,8 @@ async def verify_fido2(req: VerifyFido2Request) -> ExecutionOrder:
 
     def rejected(reason: str) -> None:
         activity.record("approval_rejected", endpoint_id=action.endpoint_id,
-                        challenge=req.challenge_id[:8], target_ip=action.target_ip, reason=reason, test=test)
+                        challenge=req.challenge_id[:8], target_ip=action.target_ip, target_path=action.target_path,
+                        reason=reason, test=test)
         _test_followup(req.challenge_id, "rejected", reason)
 
     if time.time() >= action.expires_at:
@@ -1374,10 +1644,10 @@ async def verify_fido2(req: VerifyFido2Request) -> ExecutionOrder:
     result = sign_execution_order(action, approval)
     log.warning("warden: APPROVED order=%s endpoint=%s action=%s target=%s via %s",
                 result.order["order_id"], action.endpoint_id, action.action,
-                action.target_ip, approval["method"])
+                action.target_text, approval["method"])
     activity.record("approved", endpoint_id=action.endpoint_id, challenge=req.challenge_id[:8],
                     order_id=result.order["order_id"], action=action.action,
-                    target_ip=action.target_ip, threat_score=action.threat_score,
+                    target_ip=action.target_ip, target_path=action.target_path, threat_score=action.threat_score,
                     approved_by=approval.get("credential_label") or approval["method"], test=test)
     _test_followup(req.challenge_id, "approved",
                    f"approved with passkey {approval.get('credential_label') or approval['method']}")
@@ -1400,10 +1670,13 @@ async def verify_fido2(req: VerifyFido2Request) -> ExecutionOrder:
 _BACKGROUND: set[asyncio.Task] = set()
 
 
-@app.get("/warden/orders", dependencies=[Depends(require_shipper_token)])
-async def warden_orders(endpoint_id: str = Query(pattern=r"^[A-Za-z0-9._-]{1,64}$")) -> dict:
+@app.get("/warden/orders")
+async def warden_orders(endpoint_id: str = Query(pattern=r"^[A-Za-z0-9._-]{1,64}$"),
+                        ident: ShipperIdentity = Depends(require_shipper_token)) -> dict:
     """Enforcer pickup. Returns signed orders; the enforcer verifies them itself,
     so this endpoint doesn't need to be trusted (a MITM can't forge or alter orders)."""
+    ident.check(endpoint_id)
+    rate_limit("orders", endpoint_id.lower())
     now = time.time()
     activity.touch_poll(endpoint_id)
     mine = [r for r in ORDERS.values() if r["endpoint_id"] == endpoint_id and r["expires_at"] > now]
@@ -1412,7 +1685,7 @@ async def warden_orders(endpoint_id: str = Query(pattern=r"^[A-Za-z0-9._-]{1,64}
             r["picked_up"] = True
             o = r["signed"]["order"]
             activity.record("order_picked_up", endpoint_id=endpoint_id, order_id=o["order_id"],
-                            target_ip=o["target_ip"], action=o["action"])
+                            target_ip=o["target_ip"], target_path=o.get("target_path"), action=o["action"])
     return {"orders": [r["signed"] for r in mine]}
 
 
@@ -1435,9 +1708,9 @@ async def _finish_order(order_id: str, endpoint_id: str, ack_status: str, detail
     done = ack_status in ("applied", "already_applied")
     (log.warning if done else log.error)(
         "warden: order %s on %s: %s %s %s", order_id, endpoint_id,
-        ack_status.upper(), o["target_ip"], detail)
+        ack_status.upper(), _order_target_text(o), detail)
     activity.record("enforced" if done else "enforce_failed", endpoint_id=endpoint_id,
-                    order_id=order_id, action=o["action"], target_ip=o["target_ip"],
+                    order_id=order_id, action=o["action"], target_ip=o["target_ip"], target_path=o.get("target_path"),
                     status=ack_status, detail=detail, threat_score=o["threat_score"],
                     approved_by=(o.get("approval") or {}).get("credential_label"), test=test)
     _test_followup(o["challenge_id"], "enforced" if done else "enforce_failed", detail)
@@ -1445,8 +1718,9 @@ async def _finish_order(order_id: str, endpoint_id: str, ack_status: str, detail
         title = ("🧪 End-to-end test PASSED: detection → passkey → signed order → enforcer" if done
                  else f"🧪 End-to-end test FAILED: enforcer {ack_status} the order")
     else:
-        title = (f"🛡️ Enforced: {o['action']} {o['target_ip']}" if done
-                 else f"❌ Enforcement {ack_status}: {o['action']} {o['target_ip']}")
+        title = ((f"🛡️ Quarantined: {_basename(o.get('target_path') or '')}" if o["action"] == "quarantine_file"
+                  else f"🛡️ Enforced: {o['action']} {o['target_ip']}") if done
+                 else f"❌ Enforcement {ack_status}: {o['action']} {_order_target_text(o)}")[:250]
     await _post_discord({"embeds": [{
         "title": title,
         "color": 0x16A34A if done else 0xDC2626,
@@ -1458,8 +1732,10 @@ async def _finish_order(order_id: str, endpoint_id: str, ack_status: str, detail
     return True
 
 
-@app.post("/warden/orders/{order_id}/ack", dependencies=[Depends(require_shipper)])
-async def warden_order_ack(order_id: str, ack: OrderAck) -> dict:
+@app.post("/warden/orders/{order_id}/ack")
+async def warden_order_ack(order_id: str, ack: OrderAck, ident: ShipperIdentity = Depends(require_shipper)) -> dict:
+    ident.check(ack.endpoint_id)
+    rate_limit("ack", ack.endpoint_id.lower())
     if ack.endpoint_id == testlab.TEST_ENDPOINT or not await _finish_order(
             order_id, ack.endpoint_id, ack.status, ack.detail):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown order")
@@ -1504,11 +1780,14 @@ class PresenceReport(BaseModel):
     peers: list[PresencePeer] = Field(max_length=256)
 
 
-@app.post("/presence", dependencies=[Depends(require_shipper)])
-async def presence_report(rep: PresenceReport) -> dict:
+@app.post("/presence")
+async def presence_report(rep: PresenceReport, ident: ShipperIdentity = Depends(require_shipper)) -> dict:
     """Tailscale presence from the Hub's own shipper. Only the Hub's shipper is trusted
-    for this: another endpoint reporting 'the ThinkPad is offline' could hide its silence."""
+    for this: another endpoint reporting 'the ThinkPad is offline' could hide its silence.
+    With per-endpoint tokens that's enforced cryptographically, not just by name."""
     global PRESENCE, PRESENCE_REPORTED_AT
+    ident.check(rep.endpoint_id)
+    rate_limit("presence", rep.endpoint_id.lower())
     if rep.endpoint_id.lower() != _hub_name():
         log.warning("presence: report from %s refused (only the Hub's own shipper may report)", rep.endpoint_id)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "presence is only accepted from the Hub's own shipper")
@@ -1656,7 +1935,8 @@ async def _simulate_test_enforcer(signed: dict[str, Any]) -> None:
             return
         rec["picked_up"] = True
     activity.record("order_picked_up", endpoint_id=testlab.TEST_ENDPOINT, order_id=order_id,
-                    target_ip=signed["order"]["target_ip"], action=signed["order"]["action"], test=True)
+                    target_ip=signed["order"]["target_ip"], target_path=signed["order"].get("target_path"),
+                    action=signed["order"]["action"], test=True)
     _test_followup(signed["order"]["challenge_id"], "picked_up", "test enforcer picked up the signed order")
     await asyncio.sleep(1.5)
     try:
@@ -1668,14 +1948,19 @@ async def _simulate_test_enforcer(signed: dict[str, Any]) -> None:
             (order.get("type") != "soc.execution_order", "wrong order type"),
             (order.get("endpoint_id") != testlab.TEST_ENDPOINT, "order is for a different endpoint"),
             (not (order["not_before"] - 60 <= now < order["expires_at"]), "outside its validity window"),
-            (order.get("action") != "block_ip", "unsupported action"),
+            (order.get("action") not in ("block_ip", "quarantine_file"), "unsupported action"),
             ((order.get("approval") or {}).get("method") != "webauthn"
              or not (order.get("approval") or {}).get("signature_checked"), "not approved with a real passkey"),
-            (not testlab.is_test_net(order.get("target_ip")), "target is not a documentation-range IP"),
+            (order.get("action") == "block_ip" and not testlab.is_test_net(order.get("target_ip")),
+             "target is not a documentation-range IP"),
+            (order.get("action") == "quarantine_file" and not testlab.is_test_path(order.get("target_path")),
+             "target is not a test-lab file path"),
         ] if bad]
+        what = (f"quarantine of {order.get('target_path')}" if order.get("action") == "quarantine_file"
+                else f"block of {order.get('target_ip')}")
         status_, detail = (("rejected", "; ".join(problems)) if problems else
-                           ("applied", f"SIMULATED block of {order['target_ip']}: Ed25519 signature verified "
-                                       f"with Hub key {rt.exec_key_id}, all checks passed. No firewall changed."))
+                           ("applied", f"SIMULATED {what}: Ed25519 signature verified with Hub key "
+                                       f"{rt.exec_key_id}, all checks passed. Nothing on any machine changed."))
     except Exception as exc:   # bad signature, bad encoding...
         status_, detail = "rejected", f"order failed verification: {type(exc).__name__}"
     await _finish_order(order_id, testlab.TEST_ENDPOINT, status_, detail)
@@ -1754,6 +2039,8 @@ async def warden_pending(challenge_id: str) -> dict:
         "endpoint_id": action.endpoint_id,
         "action": action.action,
         "target_ip": action.target_ip,
+        "target_path": action.target_path,
+        "target_sha256": action.target_sha256,
         "threat_score": action.threat_score,
         "attack_signatures": list(action.attack_signatures),
         "expires_at": int(action.expires_at),
@@ -1768,9 +2055,9 @@ async def warden_deny(challenge_id: str) -> dict:
         action = PENDING.pop(challenge_id, None)
     if action is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown, already used, or expired challenge")
-    log.warning("warden: challenge %s… DENIED by operator (target=%s)", challenge_id[:8], action.target_ip)
+    log.warning("warden: challenge %s… DENIED by operator (target=%s)", challenge_id[:8], action.target_text)
     activity.record("denied", endpoint_id=action.endpoint_id, challenge=challenge_id[:8],
-                    action=action.action, target_ip=action.target_ip,
+                    action=action.action, target_ip=action.target_ip, target_path=action.target_path,
                     threat_score=action.threat_score, test=action.endpoint_id == testlab.TEST_ENDPOINT)
     _test_followup(challenge_id, "denied", "denied by you")
     if action.endpoint_id != testlab.TEST_ENDPOINT:
@@ -1778,12 +2065,12 @@ async def warden_deny(challenge_id: str) -> dict:
         for k in [k for k, until in RECENT_DENIALS.items() if until <= now]:
             del RECENT_DENIALS[k]
         if len(RECENT_DENIALS) < 1024:
-            RECENT_DENIALS[(action.endpoint_id, action.target_ip, action.action)] = now + DENY_COOLDOWN_SECONDS
+            RECENT_DENIALS[(action.endpoint_id, action.target_key, action.action)] = now + DENY_COOLDOWN_SECONDS
     test = action.endpoint_id == testlab.TEST_ENDPOINT
     await _post_discord({"embeds": [{
         "title": "🧪 Deny test PASSED: action denied, nothing executed" if test else "⛔ Denied",
         "color": 0x16A34A if test else 0x6B7280,
-        "description": f"Proposed `{action.action}` on `{action.target_ip or 'none'}` "
+        "description": f"Proposed `{action.action}` on `{_safe_md(action.target_text, 300)}` "
                        f"for `{action.endpoint_id}` was denied. Nothing was executed.",
     }]}, "denial notice")
     return {"denied": True}
@@ -1978,8 +2265,12 @@ async def _run_scenario(sc: testlab.Scenario) -> testlab.TestRun:
         for i, batch in enumerate(batches, 1):
             raw = [TelemetryEvent.model_validate(e).model_dump(mode="json") for e in batch]
             _live(run.id, "attack", batch=i, of=len(batches), events=[{
+                "type": e.get("event_type") or "connection",
                 "process": e["process_name"], "path": e.get("exe_path"), "user": e.get("user"),
-                "dst": f"{e.get('dst_ip')}:{e.get('dst_port')}", "cmdline": (e.get("cmdline") or "")[:200]}
+                "dst": (f"{e.get('dst_ip')}:{e.get('dst_port')}" if e.get("dst_ip") else
+                        e.get("file_path") or e.get("reg_key") or e.get("target_process")
+                        or (f"started by {e.get('parent_name')}" if e.get("parent_name") else "")),
+                "sha256": e.get("sha256"), "cmdline": (e.get("cmdline") or "")[:200]}
                 for e in raw])
             await asyncio.sleep(TEST_STEP_DELAY)
             final = await run_pipeline(testlab.TEST_ENDPOINT, raw, test=True, quiet=not sc.escalates,
@@ -1988,7 +2279,8 @@ async def _run_scenario(sc: testlab.Scenario) -> testlab.TestRun:
             run.traces.append(final.get("trace") or [])
             run.scores.append(final.get("threat_score", 0))
             _live(run.id, "batch_done", batch=i, score=final.get("threat_score", 0),
-                  decision=final.get("decision"), target_ip=final.get("target_ip"))
+                  decision=final.get("decision"), target_ip=final.get("target_ip"),
+                  target_file=(final.get("target_file") or {}).get("path"))
         run.checks = sc.checks(finals, settings.warden_threat_threshold,
                                settings.discord_webhook_url is not None)
         if not sc.escalates:   # quiet escalations only prove the Warden would pause; withdraw them
@@ -2108,14 +2400,15 @@ async def dashboard_summary(session: dict = Depends(require_dashboard)) -> Respo
     chroma_ok, memory_size = await asyncio.to_thread(_chroma_ok)
     pending = sorted(({
         "challenge_id": a.challenge_id, "endpoint_id": a.endpoint_id, "action": a.action,
-        "target_ip": a.target_ip, "threat_score": a.threat_score,
-        "attack_signatures": list(a.attack_signatures),
+        "target_ip": a.target_ip, "target_path": a.target_path, "target_sha256": a.target_sha256,
+        "threat_score": a.threat_score, "attack_signatures": list(a.attack_signatures),
         "created_at": a.created_at, "seconds_left": max(0, int(a.expires_at - now)),
         "test": a.endpoint_id == testlab.TEST_ENDPOINT,
     } for a in PENDING.values() if a.expires_at > now), key=lambda p: p["created_at"])
     orders = [{
         "order_id": r["signed"]["order"]["order_id"], "endpoint_id": r["endpoint_id"],
         "action": r["signed"]["order"]["action"], "target_ip": r["signed"]["order"]["target_ip"],
+        "target_path": r["signed"]["order"].get("target_path"),
         "picked_up": bool(r.get("picked_up")), "seconds_left": max(0, int(r["expires_at"] - now)),
     } for r in ORDERS.values()]
     llm = snap["last_llm_status"]
@@ -2142,13 +2435,17 @@ async def dashboard_summary(session: dict = Depends(require_dashboard)) -> Respo
         "hub_name": settings.webauthn_rp_id.split(".")[0] or "hub",
         "discord_last": rt.discord_last,
         "watch": _watch_view(now),
+        "intel": intel.status(),
+        "audit": audit.status(),
+        "token_kind": dict(TOKEN_KIND),
+        "strict_tokens": settings.strict_endpoint_tokens,
         "tests": {
             "running": TEST_LOCK.locked(),
             "endpoint_id": testlab.TEST_ENDPOINT,
             "scenarios": [{"id": s.id, "name": s.name, "icon": s.icon, "tagline": s.tagline,
                            "agents": list(s.agents), "expected": s.expected, "escalates": s.escalates}
                           for s in testlab.SCENARIOS.values()],
-            "runs": [r.as_dict() for r in reversed(TEST_RUNS.values())][:12],
+            "runs": [r.as_dict() for r in reversed(TEST_RUNS.values())][:20],
         },
         **snap,
     }

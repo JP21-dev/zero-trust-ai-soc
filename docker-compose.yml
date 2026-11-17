@@ -32,6 +32,8 @@ services:
     cap_drop:
       - ALL
     mem_limit: 1g
+    memswap_limit: 1g      # no swap: a flood fails fast instead of thrashing the host
+    cpus: 2.0
     pids_limit: 256
     logging: &default-logging
       driver: json-file
@@ -67,12 +69,14 @@ services:
       SHIPPER_TOKEN_FILE: /run/secrets/shipper_token
       ACTION_SIGNING_SECRET_FILE: /run/secrets/action_signing_secret
       EXECUTION_SIGNING_KEY_FILE: /run/secrets/execution_signing_key
+      ABUSECH_AUTH_KEY_FILE: /run/secrets/abusech_auth_key
     secrets:
       - gemini_api_key
       - discord_webhook_url
       - shipper_token
       - action_signing_secret
       - execution_signing_key
+      - abusech_auth_key
     volumes:
       - warden_data:/var/lib/soc   # enrolled passkeys (public keys) + enrollment code hash
     read_only: true
@@ -83,6 +87,8 @@ services:
     cap_drop:
       - ALL
     mem_limit: 1g
+    memswap_limit: 1g      # no swap: a flood fails fast instead of thrashing the host
+    cpus: 2.0
     pids_limit: 256
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"]
@@ -114,3 +120,5 @@ secrets:
     file: ./secrets/action_signing_secret.txt
   execution_signing_key:
     file: ./secrets/execution_signing_key.txt
+  abusech_auth_key:          # optional: free key from https://auth.abuse.ch/ (leave empty to skip)
+    file: ./secrets/abusech_auth_key.txt
