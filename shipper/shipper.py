@@ -106,6 +106,13 @@ def _load_config() -> dict:
 _CFG = _load_config()
 HUB_URL = os.environ.get("SOC_HUB_URL") or _CFG.get("hub_url") or ""
 HUB_KEY_URL = os.environ.get("SOC_HUB_KEY_URL") or _CFG.get("hub_key_url") or ""
+# Presence: on the Hub's own shipper only (install-endpoint.ps1 sets it there). Once a
+# minute it tells the Hub which tailnet machines Tailscale sees online, so the Hub can
+# tell "laptop asleep" apart from "laptop online but its agent stopped".
+REPORT_PRESENCE = (os.environ.get("SOC_REPORT_PRESENCE") or str(_CFG.get("report_presence", ""))).lower() in ("1", "true")
+TAILSCALE_CLI = (os.environ.get("SOC_TAILSCALE_CLI") or _CFG.get("tailscale_cli")
+                 or (r"C:\Program Files\Tailscale\tailscale.exe" if IS_WINDOWS else "tailscale"))
+PRESENCE_EVERY = 6          # cycles (~60 s)
 TOKEN_FILE = os.environ.get("SOC_TOKEN_FILE", DEFAULT_TOKEN_FILE)
 INTERVAL = max(1.0, float(os.environ.get("SOC_INTERVAL", "10")))
 INCLUDE_CMDLINE = os.environ.get("SOC_INCLUDE_CMDLINE", "1") != "0"
@@ -391,6 +398,45 @@ def build_enforcer(token: str):
     return e
 
 
+def _clean_host(name: str) -> str:
+    """Same normalization as this machine's own endpoint id, so names line up on the Hub."""
+    return re.sub(r"[^A-Za-z0-9._-]", "-", (name or "").lower())[:64]
+
+
+def tailscale_presence() -> dict | None:
+    """Which tailnet machines Tailscale currently sees online (from `tailscale status --json`)."""
+    import subprocess
+    try:
+        out = subprocess.run([TAILSCALE_CLI, "status", "--json"], capture_output=True, timeout=15,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        data = json.loads(out.stdout or b"{}")
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        log.warning("presence: can't read tailscale status: %s", type(exc).__name__)
+        return None
+    peers = []
+    for p in list((data.get("Peer") or {}).values())[:256]:
+        host = _clean_host(p.get("HostName", ""))
+        if host:
+            peers.append({"host": host, "online": bool(p.get("Online")), "last_seen": p.get("LastSeen"),
+                          "os": (p.get("OS") or "")[:32], "name": (p.get("DNSName") or "").split(".")[0][:64]})
+    return {"endpoint_id": ENDPOINT_ID, "peers": peers}
+
+
+def report_presence(token: str) -> None:
+    body = tailscale_presence()
+    if body is None:
+        return
+    req = urllib.request.Request(hub_base_url() + "/presence", data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "X-SOC-Token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        log.warning("presence: Hub answered HTTP %d", exc.code)
+    except (urllib.error.URLError, OSError) as exc:
+        log.warning("presence: can't reach the Hub: %s", type(exc).__name__)
+
+
 def run(dry_run: bool) -> None:
     check_hub_url()
     sampler = Sampler()
@@ -414,8 +460,8 @@ def run(dry_run: bool) -> None:
 
     me = psutil.Process()
     me.cpu_percent(None)   # start the CPU measurement window
-    log.info("shipping to %s as %s every %.0fs (cmdline=%s)",
-             HUB_URL, ENDPOINT_ID, INTERVAL, INCLUDE_CMDLINE)
+    log.info("shipping to %s as %s every %.0fs (cmdline=%s, presence=%s)",
+             HUB_URL, ENDPOINT_ID, INTERVAL, INCLUDE_CMDLINE, REPORT_PRESENCE)
 
     cycle = 0
     next_tick = time.monotonic()
@@ -429,6 +475,11 @@ def run(dry_run: bool) -> None:
                 enf.poll()
             except Exception:   # never let enforcement kill telemetry
                 log.exception("enforcer poll crashed")
+        if REPORT_PRESENCE and cycle % PRESENCE_EVERY == 0 and tailscale_is_up():
+            try:
+                report_presence(token)
+            except Exception:   # never let presence reporting kill telemetry
+                log.exception("presence report crashed")
 
         cycle += 1
         if cycle % STATS_EVERY == 0:

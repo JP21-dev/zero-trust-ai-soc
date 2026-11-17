@@ -209,8 +209,13 @@ if ($CheckOnly) {
     if (-not $HubKeyUrl) { $HubKeyUrl = (Read-Host "  Hub key URL (e.g. https://soc-hub.your-tailnet.ts.net/warden/public-key)").Trim() }
     if ($HubUrl -notmatch '^https?://[^/\s]+/ingest$') { Fail "Hub URL should look like http://100.x.y.z:8080/ingest (got '$HubUrl')." }
     if ($HubKeyUrl -notmatch '^https://[^/\s]+/warden/public-key$') { Fail "Hub key URL must be https://<hub>.ts.net/warden/public-key (got '$HubKeyUrl')." }
-    @{ hub_url = $HubUrl; hub_key_url = $HubKeyUrl } | ConvertTo-Json | Set-Content -Encoding ascii -LiteralPath $configPath -ErrorAction Stop
-    Ok "Config saved: $HubUrl"
+    # On the Hub itself (detected by this project's .env), the shipper also reports Tailscale
+    # presence so the Hub can tell "asleep" from "agent stopped" for every endpoint.
+    $onHub = [bool]($envVals["TAILSCALE_IP"] -match '^100\.\d+\.\d+\.\d+$')
+    $reportPresence = $onHub -or [bool]($saved -and $saved.report_presence)
+    @{ hub_url = $HubUrl; hub_key_url = $HubKeyUrl; report_presence = $reportPresence } |
+        ConvertTo-Json | Set-Content -Encoding ascii -LiteralPath $configPath -ErrorAction Stop
+    Ok ("Config saved: $HubUrl" + $(if ($reportPresence) { " (reports Tailscale presence: this is the Hub)" } else { "" }))
 }
 
 # ------------------------------------------------------------------ 4. Pin hub key

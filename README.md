@@ -58,6 +58,10 @@ through the real pipeline and posts pass/fail to Discord.
 - **Memory that can't be poisoned.** Only clean, low-score connections are learned as
   normal; anything with a red flag is never learned.
 - **No alert spam.** One open approval per threat; a denied threat is muted for 30 minutes.
+- **Silent-agent alerts.** Malware often stops security tools first. If an endpoint's agent
+  stops checking in while Tailscale still shows the machine online, you get a Discord alert
+  (a laptop that's just asleep doesn't trigger one). Tailnet machines without the agent show
+  as unprotected on the dashboard.
 - **Zero-trust networking.** Everything is reachable only over your Tailscale tailnet. The
   vector DB has no network egress at all. Containers are read-only, non-root, no capabilities.
 - **Dashboard + test lab.** 10 attack scenarios (prompt injection, masquerading, plain

@@ -599,8 +599,11 @@ function renderHeader(d) {
   const testPending = d.pending.length - realPending;
   const busy = Object.entries(d.agents).filter(([, a]) => a.busy).map(([k]) => k);
   const offline = d.endpoints.filter((e) => e.state === "offline").length;
+  const silent = Object.entries((d.watch && d.watch.endpoints) || {}).filter(([, w]) => w.state === "silent_online").map(([k]) => k);
   let node;
-  if (realPending) node = el("span", { class: "hl alert" }, el("span", { class: "dot bad pulse" }),
+  if (silent.length) node = el("span", { class: "hl alert" }, el("span", { class: "dot bad pulse" }),
+    silent.length === 1 ? silent[0] + "'s agent went silent" : silent.length + " endpoint agents went silent");
+  else if (realPending) node = el("span", { class: "hl alert" }, el("span", { class: "dot bad pulse" }),
     plural(realPending, "action") + " waiting for your passkey");
   else if (testPending) node = el("span", { class: "hl busy" }, el("span", { class: "dot purple pulse" }),
     "Test attack waiting for your passkey");
@@ -765,25 +768,49 @@ function renderDevices(d) {
   // When the Hub also runs the shipper it reports as an endpoint named like the Hub: show one card.
   const self = d.endpoints.find((e) => e.endpoint_id === d.hub_name);
   const selfPolling = self && self.last_poll && now - self.last_poll <= 60;
+  const selfSilent = self && ((d.watch.endpoints || {})[self.endpoint_id] || {}).state === "silent_online";
   const hubDoing = busy ? "Running the " + AGENTS[busy].name + " on a batch from " + A[busy].busy.endpoint_id + "…"
       : lastRun ? "Analyzed a batch from " + lastRun.endpoint_id + " " + ago(lastRun.ts, now) + "; waiting for the next one."
       : "Waiting for telemetry.";
   cards.push(device("🖥️", d.hub_name + " (Hub)",
     ["Hub", "Runs the AI agents", "Memory", "Signs orders"].concat(self ? ["Protected endpoint"] : []),
-    ["good", "Online · up " + dur(now - d.hub_started_at)],
-    hubDoing + (self ? " Also protecting itself: telemetry " + ago(self.last_ingest, now) + ", enforcer "
-      + (selfPolling ? "checking in." : "NOT checking in.") : ""),
+    selfSilent ? ["bad pulse", "Own agent silent"] : ["good", "Online · up " + dur(now - d.hub_started_at)],
+    selfSilent ? "The Hub's own shipper/enforcer stopped checking in " + ago(self.last_seen, now)
+      + ", so this machine isn't being watched. Check Task Scheduler › SOCShipper on the Hub."
+      : hubDoing + (self ? " Also protecting itself: telemetry " + ago(self.last_ingest, now) + ", enforcer "
+      + (selfPolling ? "checking in." : "NOT checking in.") : "")
+      + (d.watch.presence_fresh ? " Watching Tailscale presence to catch silent agents." : ""),
     (h.chroma ? num(h.memory_fingerprints) + " connections remembered" : "Memory (ChromaDB) unreachable") + " · signing key " + h.execution_key_id
       + (self ? " · " + plural(self.escalations, "alert") + ", " + plural(self.blocks, "block") + " on this machine"
               : " · not protecting itself yet (run shipper\\install-endpoint.ps1)")));
   for (const e of d.endpoints.filter((x) => x !== self)) {
-    const st = { online: ["good", "Online"], idle: ["warn", "Idle"], offline: ["bad", "Offline"] }[e.state];
+    const w = (d.watch.endpoints || {})[e.endpoint_id] || {};
     const polling = e.last_poll && now - e.last_poll <= 60;
-    const doing = e.state === "offline" ? "Not reporting. Last seen " + ago(e.last_seen, now) + "."
+    let st = { online: ["good", "Online"], idle: ["warn", "Idle"], offline: ["", "Offline"] }[e.state];
+    let doing = e.state === "offline" ? "Not reporting. Last seen " + ago(e.last_seen, now) + "."
       : "Sending telemetry every 10 s (last " + ago(e.last_ingest, now) + "). "
         + (polling ? "Enforcer checking for orders (last " + ago(e.last_poll, now) + ")." : "Enforcer not checking in.");
+    if (w.state === "silent_online") {
+      st = ["bad pulse", "Agent silent"];
+      doing = "Its agent stopped checking in " + ago(w.since, now) + ", but Tailscale shows the machine online. "
+        + "Something may have stopped it: check Task Scheduler › SOCShipper on " + e.endpoint_id + ".";
+    } else if (w.state === "offline") {
+      st = ["", "Asleep / offline"];
+      doing = "Tailscale shows it offline (asleep, shut down or off the tailnet). Last check-in " + ago(e.last_seen, now)
+        + ". It picks up again when it's back.";
+    } else if (w.state === "silent_unknown") {
+      st = ["warn", "Not checking in"];
+      doing = "No check-in since " + ago(w.since, now) + ", and there's no Tailscale presence data to tell whether it's asleep.";
+    }
+    const tn = w.tailnet ? " · Tailscale: " + (w.tailnet.online ? "online" : "offline") + (w.tailnet.name ? " as " + w.tailnet.name : "") : "";
     cards.push(device("💻", e.endpoint_id, ["Endpoint", "Telemetry shipper", "Firewall enforcer"], st, doing,
-      num(e.events) + " connections reported · " + plural(e.escalations, "alert") + " · " + plural(e.blocks, "block")));
+      num(e.events) + " connections reported · " + plural(e.escalations, "alert") + " · " + plural(e.blocks, "block") + tn));
+  }
+  for (const u of d.watch.unprotected || []) {
+    cards.push(device(u.os.toLowerCase() === "windows" ? "💻" : "🖥️", u.name || u.host, ["On your tailnet", "Not protected"],
+      ["warn", u.online ? "Unprotected · online" : "Unprotected · offline"],
+      "Tailscale sees this " + u.os + " machine, but it isn't running the shipper, so nothing watches it. "
+        + "Run shipper\\install-endpoint.ps1 on it to protect it.", null));
   }
   const realPending = d.pending.filter((p) => !p.test).length;
   for (const p of d.passkeys) {
@@ -1049,6 +1076,10 @@ const KINDS = {
   dashboard_login: ["🔓", (e) => `Dashboard sign-in with ${e.label}`],
   dashboard_login_failed: ["🔒", (e) => `Dashboard sign-in failed: ${e.reason}`],
   test_run: ["🧪", (e) => `Test "${e.name}": ${e.status} (${e.passed}/${e.total} checks)`],
+  endpoint_silent: ["🚨", (e) => e.state === "silent_online"
+    ? `${e.endpoint_id}'s agent went silent while the machine is online` + (e.is_hub ? " (the Hub itself)" : "") + ` (quiet ${Math.round(e.quiet_seconds / 60)} min)`
+    : `${e.endpoint_id} stopped checking in (no Tailscale data to tell if it's asleep)`],
+  endpoint_back: ["✅", (e) => `${e.endpoint_id} is checking in again after ${Math.max(1, Math.round(e.quiet_seconds / 60))} min`],
 };
 function renderTimeline(d) {
   const items = d.timeline.filter((e) => KINDS[e.kind]);

@@ -49,6 +49,15 @@ class Settings(BaseSettings):
     warden_allow_synced_passkeys: bool = True
     # Dashboard: passkey sign-in, then a session cookie for this long.
     dashboard_session_hours: float = Field(default=12, gt=0, le=168)
+    # Silent-endpoint watchdog. An endpoint whose agent hasn't checked in for this long
+    # is "silent". If Tailscale says the machine is online (or it's the Hub itself), that's
+    # an alert: something may have stopped the agent.
+    endpoint_silent_seconds: int = Field(default=120, ge=30, le=3600)
+    # With no fresh Tailscale presence data we can't tell asleep from stopped, so wait
+    # longer before a softer "stopped checking in" alert.
+    endpoint_unknown_alert_seconds: int = Field(default=900, ge=60, le=86400)
+    # Presence reports older than this are ignored.
+    presence_max_age_seconds: int = Field(default=300, ge=60, le=3600)
 
     gemini_api_key_file: str | None = None
     discord_webhook_url_file: str | None = None

@@ -1202,6 +1202,10 @@ async def _purge_loop() -> None:
     while True:
         await asyncio.sleep(10)
         await _purge_expired()
+        try:
+            await _watch_endpoints(time.time())
+        except Exception:   # the watchdog must never take the purge loop down
+            log.exception("watchdog: check crashed")
 
 
 @asynccontextmanager
@@ -1460,6 +1464,156 @@ async def warden_order_ack(order_id: str, ack: OrderAck) -> dict:
             order_id, ack.endpoint_id, ack.status, ack.detail):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown order")
     return {"ok": True}
+
+
+# =============================================================================
+# Silent-endpoint watchdog
+# =============================================================================
+# Malware often stops security agents first. Every endpoint's enforcer checks in
+# every ~10 s; if that stops, we need to know whether the machine is just asleep or
+# whether it's online and its agent was stopped. Tailscale knows which machines are
+# online, but the Hub container can't ask it, so the Hub's OWN shipper (running on
+# the host) reports `tailscale status` here once a minute.
+#
+#   quiet + Tailscale says online  -> "silent_online"  -> 🚨 alert (possible tampering)
+#   quiet + it's the Hub itself    -> "silent_online"  -> 🚨 alert (the Hub is clearly up)
+#   quiet + Tailscale says offline -> "offline"        -> no alert (asleep / shut down / roaming)
+#   quiet + no presence data       -> "silent_unknown" -> softer alert, after a longer wait
+#   checking in again after an alert -> ✅ notice with how long it was quiet
+PRESENCE: dict[str, dict[str, Any]] = {}
+PRESENCE_REPORTED_AT = 0.0
+WATCH: dict[str, dict[str, Any]] = {}
+
+
+def _hub_name() -> str:
+    return (settings.webauthn_rp_id.split(".")[0] or "hub").lower()
+
+
+class PresencePeer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    host: str = Field(pattern=r"^[a-z0-9._-]{1,64}$")
+    online: bool
+    last_seen: str | None = Field(default=None, max_length=64)
+    os: str = Field(default="", max_length=32)
+    name: str = Field(default="", max_length=64)
+
+
+class PresenceReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    endpoint_id: str = Field(pattern=r"^[A-Za-z0-9._-]{1,64}$")
+    peers: list[PresencePeer] = Field(max_length=256)
+
+
+@app.post("/presence", dependencies=[Depends(require_shipper)])
+async def presence_report(rep: PresenceReport) -> dict:
+    """Tailscale presence from the Hub's own shipper. Only the Hub's shipper is trusted
+    for this: another endpoint reporting 'the ThinkPad is offline' could hide its silence."""
+    global PRESENCE, PRESENCE_REPORTED_AT
+    if rep.endpoint_id.lower() != _hub_name():
+        log.warning("presence: report from %s refused (only the Hub's own shipper may report)", rep.endpoint_id)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "presence is only accepted from the Hub's own shipper")
+    now = time.time()
+    PRESENCE = {p.host: {"online": p.online, "last_seen": p.last_seen, "os": p.os, "name": p.name,
+                         "reported_at": now} for p in rep.peers}
+    PRESENCE_REPORTED_AT = now
+    return {"ok": True, "peers": len(PRESENCE)}
+
+
+def _presence_fresh(now: float) -> bool:
+    return now - PRESENCE_REPORTED_AT <= settings.presence_max_age_seconds
+
+
+def _ago(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s}s" if s < 60 else f"{s // 60}m {s % 60:02d}s" if s < 3600 else f"{s // 3600}h {s % 3600 // 60}m"
+
+
+async def _watch_endpoints(now: float) -> None:
+    silent_after = settings.endpoint_silent_seconds
+    # After a Hub restart, last_poll times are gone; give every enforcer time to check in.
+    if now - activity.started_at < silent_after + 30:
+        return
+    fresh = _presence_fresh(now)
+    hub = _hub_name()
+    for ep in [dict(e) for e in list(activity.endpoints.values())]:
+        ep_id = ep["endpoint_id"]
+        seen = max(ep.get("last_ingest") or 0, ep.get("last_poll") or 0)
+        if not seen:
+            continue
+        quiet = now - seen
+        w = WATCH.setdefault(ep_id, {"state": "ok", "since": None, "alerted": None})
+        if quiet <= silent_after:
+            if w["alerted"]:
+                gap = now - (w["since"] or now)
+                activity.record("endpoint_back", endpoint_id=ep_id, quiet_seconds=round(gap))
+                log.warning("watchdog: %s is checking in again after %s", ep_id, _ago(gap))
+                await _post_discord({"embeds": [{
+                    "title": f"✅ {ep_id} is checking in again",
+                    "color": 0x16A34A,
+                    "description": f"Its agent was quiet for **{_ago(gap)}** and is reporting normally now.",
+                }]}, "endpoint back notice")
+            WATCH[ep_id] = {"state": "ok", "since": None, "alerted": None}
+            continue
+        pres = PRESENCE.get(ep_id) if fresh else None
+        if ep_id == hub:
+            state = "silent_online"
+        elif pres is not None:
+            state = "silent_online" if pres["online"] else "offline"
+        else:
+            state = "silent_unknown"
+        w["state"], w["since"] = state, w["since"] or seen
+        should_alert = (state == "silent_online" and w["alerted"] != "silent_online") or (
+            state == "silent_unknown" and not w["alerted"] and quiet >= settings.endpoint_unknown_alert_seconds)
+        if not should_alert:
+            continue
+        w["alerted"] = state
+        online = state == "silent_online"
+        activity.record("endpoint_silent", endpoint_id=ep_id, state=state, quiet_seconds=round(quiet),
+                        tailnet_online=None if pres is None else pres["online"], is_hub=ep_id == hub)
+        log.warning("watchdog: %s SILENT for %s (%s)", ep_id, _ago(quiet), state)
+        if ep_id == hub:
+            why = ("This is the Hub itself, so the machine is definitely running. Its own shipper/enforcer has "
+                   "stopped: check Task Scheduler › SOCShipper on the Hub.")
+        elif online:
+            why = (f"Tailscale shows **{_safe_md(pres.get('name') or ep_id, 64)}** online, so the machine is up but "
+                   "its agent has stopped. That can be a crash or an update, or malware disabling security tools. "
+                   "Check Task Scheduler › SOCShipper on it.")
+        else:
+            why = ("There's no fresh Tailscale presence data, so it may simply be asleep or off the tailnet. "
+                   "If it should be on, check Task Scheduler › SOCShipper on it.")
+        await _post_discord({"embeds": [{
+            "title": (f"🚨 {ep_id}: agent went silent while the machine is online" if online
+                      else f"⚠️ {ep_id} stopped checking in"),
+            "color": 0xDC2626 if online else 0xF59E0B,
+            "description": why,
+            "fields": [
+                {"name": "Last check-in", "value": f"<t:{int(seen)}:R>", "inline": True},
+                {"name": "Quiet for", "value": _ago(quiet), "inline": True},
+                {"name": "Tailscale", "value": ("this is the Hub" if ep_id == hub else
+                                                "online" if online else "no data"), "inline": True},
+            ],
+        }]}, "silent endpoint alert")
+
+
+def _watch_view(now: float) -> dict[str, Any]:
+    """Watchdog + presence data for the dashboard."""
+    fresh = _presence_fresh(now)
+    known = {e["endpoint_id"] for e in activity.endpoints.values()}
+    hub = _hub_name()
+    unprotected = [{"host": h, "name": p["name"], "os": p["os"], "online": p["online"]}
+                   for h, p in PRESENCE.items()
+                   if h not in known and h != hub and p["os"].lower() in ("windows", "macos", "linux")] if fresh else []
+    return {
+        "presence_fresh": fresh,
+        "presence_age": round(now - PRESENCE_REPORTED_AT) if PRESENCE_REPORTED_AT else None,
+        "silent_after": settings.endpoint_silent_seconds,
+        "endpoints": {ep: {"state": w["state"], "since": w["since"], "alerted": w["alerted"],
+                           "tailnet": PRESENCE.get(ep) if fresh else None}
+                      for ep, w in WATCH.items()} | {
+            ep: {"state": "ok", "since": None, "alerted": None, "tailnet": PRESENCE.get(ep) if fresh else None}
+            for ep in known if ep not in WATCH},
+        "unprotected": unprotected,
+    }
 
 
 # =============================================================================
@@ -1987,6 +2141,7 @@ async def dashboard_summary(session: dict = Depends(require_dashboard)) -> Respo
         "orders": orders,
         "hub_name": settings.webauthn_rp_id.split(".")[0] or "hub",
         "discord_last": rt.discord_last,
+        "watch": _watch_view(now),
         "tests": {
             "running": TEST_LOCK.locked(),
             "endpoint_id": testlab.TEST_ENDPOINT,
