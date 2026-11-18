@@ -26,7 +26,8 @@ from typing import Any
 
 log = logging.getLogger("soc.agentcheck")
 
-AGENT_FILES = ("shipper.py", "enforcer.py", "sysmon.py", "winlog.py", "sysmon-config.xml")
+AGENT_FILES = ("shipper.py", "enforcer.py", "sysmon.py", "winlog.py", "updater.py", "agent_launcher.py",
+               "sysmon-config.xml")
 
 
 class AgentReleases:

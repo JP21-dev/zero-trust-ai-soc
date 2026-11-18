@@ -67,6 +67,8 @@ class Settings(BaseSettings):
     strict_endpoint_tokens: bool = False
     # The Hub's read-only copy of the shipper folder, for the agent self-check (agentcheck.py).
     agent_release_dir: Path = Path("/app/shipper_release")
+    # Deployer: propose agent releases for your passkey when the shipper folder changes.
+    deployer_enabled: bool = True
 
     @property
     def abusech_auth_key(self) -> str | None:

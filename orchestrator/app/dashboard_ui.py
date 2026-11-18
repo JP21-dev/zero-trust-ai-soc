@@ -67,6 +67,15 @@ DASHBOARD_HTML = """<!doctype html>
       <div id="devgrid" class="devgrid"></div>
     </section>
 
+    <section id="updates" class="section">
+      <div class="section-head">
+        <div><h2>Agent updates</h2>
+          <p class="sub">The Deployer keeps every endpoint on the Hub's current build. Each release needs your passkey, and each endpoint checks that signature itself before installing.</p></div>
+        <button id="propose" type="button">Propose release</button>
+      </div>
+      <div class="card"><p id="deploy-status" class="sub"></p><div id="rollout" class="tablewrap"></div></div>
+    </section>
+
     <section id="testlab" class="section">
       <div class="section-head">
         <div><h2>Test lab</h2>
@@ -249,7 +258,7 @@ border:1.5px solid var(--critical);background:linear-gradient(90deg,rgba(208,59,
 .pcard .actions{display:flex;gap:.5rem}
 @media (max-width:760px){.pcard{grid-template-columns:1fr}.pcard .side{justify-items:start}}
 /* agent flow */
-.flow{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:1.4rem;position:relative;margin-bottom:1rem}
+.flow{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:1.4rem;position:relative;margin-bottom:1rem}
 @media (max-width:1200px){.flow{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media (max-width:760px){.flow{grid-template-columns:1fr}}
 .agent{position:relative;display:flex;flex-direction:column;gap:.6rem;padding:1rem 1rem .9rem;border-radius:var(--radius);
@@ -625,16 +634,20 @@ function renderPending(d) {
   pendingState = d.pending; fetchedAt = Date.now() / 1000;
   $("pending-wrap").hidden = !d.pending.length;
   $("pending").replaceChildren(...d.pending.map((p) => el("div", { class: "pcard" + (p.test ? " test" : "") },
-    el("div", { class: "big-score" }, String(p.threat_score), el("small", { text: "threat" })),
+    p.action === "deploy_release" ? el("div", { class: "big-score" }, "📦", el("small", { text: "update" }))
+      : el("div", { class: "big-score" }, String(p.threat_score), el("small", { text: "threat" })),
     el("div", null,
-      el("div", { class: "what" }, p.test ? testTag() : null, p.test ? " " : null,
-        "Approve ", el("code", { text: p.action }), " on ", el("code", { text: tgt(p) }),
-        " for ", el("code", { text: p.endpoint_id }), "?"),
+      p.action === "deploy_release"
+        ? el("div", { class: "what" }, "Install ", el("code", { text: p.target_path.replace(/^agent /, "") }),
+            " of the SOC agent on all endpoints?")
+        : el("div", { class: "what" }, p.test ? testTag() : null, p.test ? " " : null,
+          "Approve ", el("code", { text: p.action }), " on ", el("code", { text: tgt(p) }),
+          " for ", el("code", { text: p.endpoint_id }), "?"),
       el("ul", null, (p.attack_signatures.length ? p.attack_signatures : ["No signature given"]).map((s) => el("li", { text: s })))),
     el("div", { class: "side" },
       el("div", { class: "ttl", "data-ttl": p.challenge_id }),
       el("div", { class: "actions" },
-        el("a", { class: "btn " + (p.test ? "primary" : "danger"), href: "/warden/approve/" + encodeURIComponent(p.challenge_id),
+        el("a", { class: "btn " + (p.test || p.action === "deploy_release" ? "primary" : "danger"), href: "/warden/approve/" + encodeURIComponent(p.challenge_id),
                   text: "Review & approve" }),
         el("button", { text: "Deny", onclick: (ev) => deny(p.challenge_id, ev.currentTarget) }))))));
   tickPending();
@@ -661,14 +674,16 @@ const AGENTS = {
   strategist: { name: "Strategist", icon: "🧠", role: "Scores the threat 0–100 with malware rules + Gemini" },
   warden: { name: "Warden", icon: "⚖️", role: "Logs it, or pauses and asks for your passkey" },
   enforcer: { name: "Enforcer", icon: "🧱", role: "Applies approved blocks on each endpoint's firewall" },
+  deployer: { name: "Deployer", icon: "📦", role: "Keeps every endpoint's agent on the current build" },
 };
-const ORDER = ["gatekeeper", "detective", "strategist", "warden", "enforcer"];
+const ORDER = ["gatekeeper", "detective", "strategist", "warden", "enforcer", "deployer"];
 function agentStats(k, s) {
   switch (k) {
     case "gatekeeper": return [[num(s.checked), "checked"], [num(s.dropped), "known-safe"], [num(s.injections + s.findings), "threats caught"]];
     case "detective": return [[num(s.lookups), "lookups"], [num(s.novel), "new"], [num(s.lookups - s.novel), "recognized"]];
     case "strategist": return [[num(s.runs), "scored"], [String(s.max_score), "highest"], [num(s.gemini), "by Gemini"]];
     case "warden": return [[num(s.escalated), "escalated"], [num(s.approved), "approved"], [num(s.denied + s.expired), "denied/expired"]];
+    case "deployer": return [[s.release ? "#" + s.release : "none", "release"], [num(s.current), "current"], [num(s.behind), "behind"]];
     default: return [[num(s.blocks), "blocks"], [num(s.failed), "failed"], [num(s.endpoints), "checking in"]];
   }
 }
@@ -685,6 +700,13 @@ function renderAgents(d) {
     } else if (waiting) {
       state = "Waiting for you"; dotCls = "bad pulse"; cls += " alert";
       nowText = plural(d.pending.length, "action") + " paused until you approve or deny with your passkey.";
+    } else if (k === "deployer") {
+      const dp = d.deployer || {}, st = dp.status || "";
+      state = dp.proposal ? "Waiting for you" : /^up to date/.test(st) ? "Up to date" : /^off/.test(st) ? "Off" : "Working";
+      dotCls = dp.proposal ? "bad pulse" : /^up to date/.test(st) ? "good" : /^off/.test(st) ? "warn" : "purple pulse";
+      if (dp.proposal) cls += " alert";
+      nowText = st.charAt(0).toUpperCase() + st.slice(1) + ".";
+      if (dp.current) when = "Release #" + dp.current.seq + " approved " + ago(dp.current.approved_at, now) + " by " + dp.current.approved_by;
     } else if (k === "enforcer") {
       const polling = a.polling || [];
       state = polling.length ? "Standing guard" : "Not connected"; dotCls = polling.length ? "good" : "warn";
@@ -708,6 +730,25 @@ function renderAgents(d) {
       el("div", { class: "agent-stats", title: "Last 24 hours, real traffic" },
         agentStats(k, a.stats || {}).map(([v, l]) => el("div", null, el("b", { text: v }), el("span", { text: l })))));
   }));
+}
+function renderUpdates(d) {
+  const dp = d.deployer || { endpoints: {} };
+  $("deploy-status").textContent = "Deployer: " + (dp.status || "starting") + "."
+    + (dp.current ? " Current release #" + dp.current.seq + ", approved " + ago(dp.current.approved_at, d.now) + "." : "");
+  const say = { applied: "updated", up_to_date: "already current", rolled_back: "⚠ rolled back", needs_installer: "needs the installer",
+    rejected: "⚠ refused the release", failed: "⚠ install failed" };
+  const code = { ok: "verified", outdated: "outdated", modified: "⚠ changed", unverifiable: "can't check" };
+  $("rollout").replaceChildren(table(["Endpoint", "Agent code", "Last update", "Checked for updates"],
+    Object.entries(dp.endpoints).map(([ep, v]) => [el("code", { text: ep }), code[v.code] || "not reported",
+      v.status ? (say[v.status] || v.status) + " · #" + v.seq + (v.detail ? " · " + v.detail : "") : "—",
+      v.checked_at ? ago(v.checked_at, d.now) : "never"]),
+    "No endpoints yet."));
+}
+async function proposeRelease() {
+  const b = $("propose"); b.disabled = true;
+  try { const r = await api("/dashboard/api/releases/propose", {}); $("deploy-status").textContent = "Deployer: " + r.status + "."; }
+  catch (e) { $("deploy-status").textContent = "Couldn't propose a release: " + e.message; }
+  finally { b.disabled = false; }
 }
 function enforcerText(e) {
   if (e.kind === "enforced") return (e.target_path ? "quarantined " : "blocked ") + tgt(e) + " on " + e.endpoint_id;
@@ -1085,6 +1126,13 @@ const KINDS = {
     : `${e.endpoint_id} stopped checking in (no Tailscale data to tell if it's asleep)`],
   audit_broken: ["🚨", (e) => `Audit log failed verification at entry ${e.broken_at} of ${e.entries}: history was modified`],
   agent_modified: ["🚨", (e) => `${e.endpoint_id}: the SOC agent's code was changed (${(e.files || []).join(", ")})`],
+  release_proposed: ["📦", (e) => `Release #${e.seq} proposed (${(e.changed || []).join(", ") || "first release"}): waiting for your passkey`],
+  release_approved: ["✅", (e) => `Release #${e.seq} approved by ${e.approved_by}`],
+  release_applied: ["⬆️", (e) => `${e.endpoint_id} updated to release #${e.seq}`],
+  release_rolled_back: ["↩️", (e) => `${e.endpoint_id} rolled back release #${e.seq}: ${e.detail}`],
+  release_needs_installer: ["🧰", (e) => `${e.endpoint_id} needs the installer for release #${e.seq}: ${e.detail}`],
+  release_rejected: ["🚨", (e) => `${e.endpoint_id} refused release #${e.seq}: ${e.detail}`],
+  release_failed: ["⚠️", (e) => `${e.endpoint_id} couldn't install release #${e.seq}: ${e.detail}`],
   agent_restored: ["✅", (e) => `${e.endpoint_id}: the SOC agent's code is back to a known version`],
   endpoint_back: ["✅", (e) => `${e.endpoint_id} is checking in again after ${Math.max(1, Math.round(e.quiet_seconds / 60))} min`],
 };
@@ -1304,7 +1352,7 @@ function renderLive(d) {
 let last = null, timer = null, ticker = null;
 function render(d) {
   last = d;
-  renderHeader(d); renderPending(d); renderAgents(d); renderFeed(d); renderDevices(d); renderTests(d);
+  renderHeader(d); renderPending(d); renderAgents(d); renderFeed(d); renderDevices(d); renderUpdates(d); renderTests(d);
   renderKpis(d); volumeChart(d.series); scoreChart(d.series, d.health.threshold);
   renderTimeline(d); renderBlocks(d); renderNewConns(d); renderSystem(d);
   if (d.tests.running && !live.open && !live.dismissed) openLive();   // e.g. a test started from another tab
@@ -1330,6 +1378,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("signin").addEventListener("click", signIn);
   $("logout").addEventListener("click", signOut);
   $("run-all").addEventListener("click", () => runTest("all"));
+  $("propose").addEventListener("click", proposeRelease);
   $("live-close").addEventListener("click", closeLive);
   $("live-body").addEventListener("scroll", () => {
     if (live.autoScroll) return;   // ignore our own scrolling; only you can unstick it

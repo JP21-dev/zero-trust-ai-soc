@@ -1,7 +1,7 @@
 # Zero-Trust Multi-Agent AI SOC
 
-A self-hosted, home-lab **Security Operations Center** where four AI agents watch your
-Windows machines' network activity, and **nothing gets blocked until you approve it with
+A self-hosted, home-lab **Security Operations Center** where AI agents watch your
+Windows machines' network, file and system activity, and **nothing gets blocked until you approve it with
 a passkey on your phone**.
 
 ```
@@ -69,6 +69,11 @@ through the real pipeline and posts pass/fail to Discord.
   new scheduled tasks, password guessing, new local accounts and new administrators.
 - **Agent self-check.** Each endpoint reports a fingerprint of its own code; the Hub alerts
   in Discord if it doesn't match any version the Hub shipped.
+- **Passkey-approved agent updates.** When the Hub's `shipper` folder changes, the Deployer
+  proposes a release and you approve it with your passkey. Endpoints pull it the next time
+  they're online and install it only after checking *your passkey's* signature on that exact
+  release themselves, so a compromised Hub can't push code to them. A version that doesn't
+  start cleanly is rolled back automatically.
 - **Passkey-approved quarantine.** For a malicious file the Warden proposes a quarantine; once
   you approve, the endpoint moves the file only if its fingerprint still matches, never
   touches `C:\Windows` or Program Files, and can restore it (`shipper.py --restore`).
@@ -188,6 +193,7 @@ else gets a **review alert** with no automatic action.
 | Flooding the Hub | Thousands of requests per second | Rate limits plus container CPU/memory/process caps | |
 | Rewriting the history | Editing the activity log to hide an incident | Hash-chained audit log, checked at startup, daily checkpoints in Discord | |
 | Killing the agent | Malware stopping the shipper on an endpoint | Silent-agent alert when Tailscale still shows the machine online | |
+| Pushing malicious agent code | Using a hijacked Hub to "update" every endpoint with malware | Endpoints only install a release your passkey signed (the WebAuthn challenge is the release's own hash), checked on the endpoint against passkeys pinned at install; only the agent's own files can be replaced, never with an older release | |
 | Tampering with the agent | Editing or deleting the shipper's code on an endpoint | Self-check: every ~10 min the agent reports its files' SHA-256; any version the Hub never shipped is a 🚨 Discord alert (an agent that's merely out of date is shown, not alerted). It catches casual tampering; an attacker already running as SYSTEM could fake the report | |
 
 ### Not covered yet
@@ -285,6 +291,17 @@ powershell -ExecutionPolicy Bypass -File .\install-endpoint.ps1 `
 The installer uses an all-users Python, locks the install folder so normal users can't
 modify code that runs as SYSTEM, pins the Hub's key, does a dry run, and registers a
 startup task. Add `-DryRunEnforcement` to log blocks without touching the firewall first.
+It also pins your enrolled passkeys, so enroll yours (step 2) before installing endpoints.
+
+### Updating
+
+After the first install, endpoints update themselves. Pull the new version on the Hub
+(`git pull`, then `docker compose up -d --build`). Within a minute the Deployer posts
+"📦 New agent build" to Discord; approve it with your passkey, and each endpoint installs it
+within about 5 minutes of being online. The dashboard's **Agent updates** panel shows where
+each one is. Re-run the installer only when an update says it needs it (a new Python
+dependency, or a change to `agent_launcher.py`). Set `DEPLOYER_ENABLED=false` in `.env` to
+update with the installer only.
 
 ### 4. Open the dashboard
 
@@ -308,6 +325,9 @@ Be honest with yourself about what this does **not** do:
   their own.
 - **Blocks don't expire** and the dashboard isn't told about `--unblock`.
 - **Single operator.** One set of passkeys; no user management.
+- **Passkey trust starts at install.** The installer trusts the Hub's passkey list, like the
+  order key. After that, only a release signed by an already-trusted passkey can change it,
+  so a revoked passkey stops being trusted on endpoints with the next release.
 - Tested by its author on a small home tailnet. Expect rough edges.
 
 ## Repository layout
@@ -325,12 +345,15 @@ orchestrator/app/
   intel.py                Threat intel: file fingerprints (EICAR, custom, MalwareBazaar),
                           domains and C2 servers (ThreatFox)
   agentcheck.py           Agent self-check against the Hub's copy of shipper/
+  releases.py             Agent releases for the Deployer
   audit.py                Hash-chained audit log
   tokens.py               Per-endpoint tokens
 shipper/
   shipper.py              Endpoint telemetry shipper
   sysmon.py               Reads Sysmon file/process/registry/DNS/network events
   winlog.py               Reads Defender, service, task, login and account events
+  updater.py              Checks your passkey's signature on a release, installs it
+  agent_launcher.py       Runs the agent; restarts it on updates, rolls back bad ones
   sysmon-config.xml       Sysmon config: only what the rules need
   enforcer.py             Verifies signed orders, applies firewall blocks and quarantine
   install-endpoint.ps1    One-command Windows installer

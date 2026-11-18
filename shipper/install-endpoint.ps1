@@ -18,8 +18,9 @@
        logging the rules read: failed logins, account and group changes, new
        scheduled tasks.
     6. Does one dry run (prints a batch, sends nothing).
-    7. Registers the "SOCShipper" scheduled task: at startup, as SYSTEM, restarts on
-       failure, and starts it now.
+    7. Registers the "SOCShipper" scheduled task: at startup, as SYSTEM, and starts it
+       now. The task runs agent_launcher.py, which keeps the agent running and installs
+       or rolls back self-updates you approved with your passkey.
 
   Safe to re-run: it updates the files and restarts the task.
 
@@ -86,7 +87,8 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $CheckOnly -and -not $isAdmin) {
     Fail "Run this from an elevated PowerShell (right-click PowerShell > Run as administrator)."
 }
-foreach ($f in "shipper.py", "enforcer.py", "sysmon.py", "winlog.py", "sysmon-config.xml", "requirements.txt") {
+$agentFiles = "shipper.py", "enforcer.py", "sysmon.py", "winlog.py", "updater.py", "agent_launcher.py", "sysmon-config.xml", "requirements.txt"
+foreach ($f in $agentFiles) {
     if (-not (Test-Path (Join-Path $here $f))) { Fail "$f not found next to this script ($here)." }
 }
 
@@ -128,11 +130,16 @@ $venvPy  = Join-Path $InstallDir ".venv\Scripts\python.exe"
 $venvPyw = Join-Path $InstallDir ".venv\Scripts\pythonw.exe"
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($CheckOnly) {
-    Info "Would copy shipper.py, enforcer.py, sysmon.py, winlog.py, sysmon-config.xml, requirements.txt and build a venv."
+    Info "Would copy $($agentFiles -join ', ') and build a venv."
     Info ("Existing install: " + $(if (Test-Path $venvPy) { "yes (will be updated)" } else { "no" }))
     Info ("Scheduled task '$TaskName': " + $(if ($task) { $task.State } else { "not registered" }))
 } else {
     if ($task -and $task.State -eq "Running") { Stop-ScheduledTask -TaskName $TaskName; Info "Stopped the running task for the update." }
+    # The agent runs as a child of the launcher; make sure no copy outlives the task.
+    $venvDir = (Join-Path $InstallDir ".venv").ToLower()
+    Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.ToLower().StartsWith($venvDir) } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     New-Item -ItemType Directory -Force -Path $InstallDir -ErrorAction Stop | Out-Null
     # SYSTEM runs this code: normal users may read it but never change it.
     # Lock the folder FIRST so everything created below inherits the lock. Set it on
@@ -145,7 +152,7 @@ if ($CheckOnly) {
         icacls (Join-Path $InstallDir "*") /reset /T /C /Q | Out-Null
         if ($LASTEXITCODE) { Fail "Couldn't reset permissions inside $InstallDir (icacls exit $LASTEXITCODE)." }
     }
-    Copy-Item (Join-Path $here "shipper.py"), (Join-Path $here "enforcer.py"), (Join-Path $here "sysmon.py"), (Join-Path $here "winlog.py"), (Join-Path $here "sysmon-config.xml"), (Join-Path $here "requirements.txt") $InstallDir -Force -ErrorAction Stop
+    Copy-Item ($agentFiles | ForEach-Object { Join-Path $here $_ }) $InstallDir -Force -ErrorAction Stop
     if (-not (Test-Path (Join-Path $InstallDir ".venv\pyvenv.cfg"))) {
         & $py.Path -m venv --clear (Join-Path $InstallDir ".venv"); if ($LASTEXITCODE) { Fail "venv creation failed." }
     }
@@ -258,6 +265,9 @@ else {
         if ($ans -notmatch '^[Yy]') { Remove-Item (Join-Path $StateDir "hub_pubkey.json") -Force; Fail "Not confirmed. Removed the pinned key." }
         Ok "Confirmed."
     }
+    $pk = [regex]::Match($out, "Pinned (\d+) passkey").Groups[1].Value
+    if ($pk -and [int]$pk -gt 0) { Ok "Pinned $pk passkey(s): self-updates need one of them to approve." }
+    else { Info "Warning: no passkeys pinned, so self-updates stay off here. Enroll a passkey on the Hub, then re-run this." }
 }
 
 # ------------------------------------------------------------------ 5. Sysmon
@@ -351,11 +361,11 @@ $mode = if ($DryRunEnforcement) { "LOG-ONLY enforcement (no firewall changes)" }
 if ($CheckOnly) { Info "Would register and start it in $mode." ; Write-Host ""; Write-Host "Check only: nothing was changed." -ForegroundColor Magenta; exit 0 }
 if ($DryRunEnforcement) {
     $launcher = Join-Path $InstallDir "run-dryrun.cmd"
-    Set-Content -Encoding ascii -LiteralPath $launcher -Value "@set SOC_ENFORCE_DRY_RUN=1`r`n@`"$venvPyw`" `"$InstallDir\shipper.py`""
+    Set-Content -Encoding ascii -LiteralPath $launcher -Value "@set SOC_ENFORCE_DRY_RUN=1`r`n@`"$venvPyw`" `"$InstallDir\agent_launcher.py`""
     $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$launcher`"" -WorkingDirectory $InstallDir
 } else {
     Remove-Item (Join-Path $InstallDir "run-dryrun.cmd") -ErrorAction SilentlyContinue
-    $action = New-ScheduledTaskAction -Execute $venvPyw -Argument "`"$InstallDir\shipper.py`"" -WorkingDirectory $InstallDir
+    $action = New-ScheduledTaskAction -Execute $venvPyw -Argument "`"$InstallDir\agent_launcher.py`"" -WorkingDirectory $InstallDir
 }
 $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable

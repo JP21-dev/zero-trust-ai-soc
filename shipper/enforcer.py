@@ -131,8 +131,13 @@ def pin_hub_key(url: str, path: Path) -> PinnedKey:
     with urllib.request.urlopen(url, timeout=30) as resp:
         data = json.loads(resp.read())
     key = PinnedKey(data)
+    # Also pin the passkeys that may approve agent self-updates (see updater.py).
+    passkeys = [{"id": str(k["id"]), "spki": str(k["spki"])} for k in data.get("passkeys") or []
+                if isinstance(k, dict) and k.get("id") and k.get("spki")]
     _write_json_atomic(path, {"alg": "Ed25519", "key_id": key.key_id,
                               "public_key_b64url": key.public_key_b64url,
+                              "passkeys": passkeys, "origin": str(data.get("origin") or ""),
+                              "rp_id": str(data.get("rp_id") or ""),
                               "pinned_from": url, "pinned_at": _now_iso()})
     return key
 

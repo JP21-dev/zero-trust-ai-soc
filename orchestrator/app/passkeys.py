@@ -120,6 +120,22 @@ def has_credentials() -> bool:
     return bool(list_credentials())
 
 
+def public_keys() -> list[dict[str, str]]:
+    """Enrolled passkeys as SubjectPublicKeyInfo (DER, base64url). Endpoints pin these and
+    check release approvals themselves, so they don't have to trust the Hub for it."""
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    from webauthn.helpers import decode_credential_public_key, decoded_public_key_to_cryptography
+    out = []
+    for c in list_credentials():
+        try:
+            key = decoded_public_key_to_cryptography(decode_credential_public_key(b64url_decode(c["public_key"])))
+            spki = key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        except Exception:   # an algorithm the endpoints can't check; it just isn't pinned
+            continue
+        out.append({"id": c["id"], "label": c["label"], "spki": b64url(spki)})
+    return out
+
+
 def _find(cred_id: str) -> dict[str, Any] | None:
     return next((c for c in list_credentials() if hmac.compare_digest(c["id"], cred_id)), None)
 

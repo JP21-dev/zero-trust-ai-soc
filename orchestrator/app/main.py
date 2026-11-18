@@ -68,6 +68,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from app import dashboard_auth, dashboard_ui, passkeys, testlab, tokens, warden_ui
 from app.activity import Activity
 from app.agentcheck import AgentReleases
+from app.releases import RELEASE_FILES, ReleaseStore, files_digest
 from app.audit import AuditLog
 from app.intel import Intel
 from app.config import get_settings
@@ -77,6 +78,7 @@ activity = Activity(Path(settings.warden_data_dir) / "activity.jsonl")
 intel = Intel(Path(settings.warden_data_dir))
 audit = AuditLog(Path(settings.warden_data_dir) / "audit.jsonl")
 agents = AgentReleases(Path(settings.agent_release_dir), Path(settings.warden_data_dir))
+releases = ReleaseStore(Path(settings.agent_release_dir), Path(settings.warden_data_dir))
 activity.audit = audit
 logging.basicConfig(
     level=settings.log_level,
@@ -1570,11 +1572,13 @@ async def lifespan(_: FastAPI):
         rt.collection = None
     purger = asyncio.create_task(_purge_loop())
     intel_task = asyncio.create_task(_intel_loop())
+    deploy_task = asyncio.create_task(_deploy_loop())
     try:
         yield
     finally:
         purger.cancel()
         intel_task.cancel()
+        deploy_task.cancel()
         await rt.http.aclose()
 
 
@@ -1631,6 +1635,7 @@ async def require_shipper_token(x_soc_token: str | None = Header(default=None)) 
 _BUCKETS: dict[str, list[float]] = {}   # key -> [tokens, last_refill]
 RATE_LIMITS = {   # route: (per-minute rate, burst). Normal shippers use a fraction of these.
     "ingest": (30, 30), "orders": (30, 20), "ack": (30, 20), "presence": (6, 4), "integrity": (6, 4),
+    "releases": (12, 6), "release_files": (30, 20), "release_report": (6, 4),
 }
 
 
@@ -1742,6 +1747,9 @@ async def verify_fido2(req: VerifyFido2Request) -> ExecutionOrder:
                     req.challenge_id[:8], exc)
         rejected(f"passkey assertion rejected: {exc}")
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"assertion rejected: {exc}") from None
+
+    if action.action == "deploy_release":
+        return await _approve_release(action, req.webauthn_assertion, approval)
 
     result = sign_execution_order(action, approval)
     log.warning("warden: APPROVED order=%s endpoint=%s action=%s target=%s via %s",
@@ -1944,6 +1952,192 @@ async def integrity_report(rep: IntegrityReport, ident: ShipperIdentity = Depend
             "description": "Its files match " + ("the Hub's copy." if result["state"] == "ok" else "a version the Hub shipped before."),
         }]}, "agent restored notice")
     return {"ok": True, "state": result["state"]}
+
+
+# =============================================================================
+# Deployer: keeps every endpoint's agent up to date, with your passkey on each release
+# =============================================================================
+# It watches the Hub's shipper folder. When it differs from the current release, it
+# proposes a new one (Discord + the usual approval page). Your passkey signs the
+# release manifest itself, and each endpoint verifies that signature before
+# installing (shipper/updater.py). Endpoints pull it the next time they're online.
+DEPLOY: dict[str, Any] = {"proposal": None, "status": "starting", "last_tick": None, "proposed_at": {}}
+ROLLOUT: dict[str, dict[str, Any]] = {}       # endpoint -> last update report
+RELEASE_APPROVAL_SECONDS = 3600
+REPROPOSE_AFTER_SECONDS = 6 * 3600
+
+
+async def _deploy_loop() -> None:
+    await asyncio.sleep(15)
+    while True:
+        try:
+            await _deployer_tick()
+        except Exception:
+            log.exception("deployer: tick failed")
+        await asyncio.sleep(60)
+
+
+async def _deployer_tick(force: bool = False) -> str:
+    now = time.time()
+    DEPLOY["last_tick"] = now
+
+    def status(text: str) -> str:
+        DEPLOY["status"] = text
+        return text
+
+    if not settings.deployer_enabled:
+        return status("off (DEPLOYER_ENABLED=false)")
+    if settings.warden_assertion_mode != "webauthn":
+        return status("off: releases need real passkey signatures (WARDEN_ASSERTION_MODE=webauthn)")
+    keys = passkeys.public_keys()
+    if not keys:
+        return status("off: no passkey enrolled")
+    prop = DEPLOY.get("proposal")
+    if prop and prop["challenge_id"] in PENDING:
+        return status(f"waiting for your passkey on release #{prop['seq']}")
+    DEPLOY["proposal"] = None
+    files = await asyncio.to_thread(releases.hub_files)
+    if files is None:
+        return status("off: the Hub has no complete copy of the shipper folder")
+    digest = files_digest(ReleaseStore.hashes(files))
+    if digest == releases.current_digest():
+        return status(f"up to date: release #{releases.current['seq']}")
+    if not force and digest == releases.state.get("denied"):
+        return status("new build waiting: you denied it (use 'Propose release' to ask again)")
+    if not force and now - DEPLOY["proposed_at"].get(digest, 0) < REPROPOSE_AFTER_SECONDS:
+        return status("new build waiting: the last request expired; asking again later")
+    built = await asyncio.to_thread(releases.build, files, keys, settings.webauthn_origin, settings.webauthn_rp_id)
+    await _propose_release(built, now)
+    return status(f"waiting for your passkey on release #{built['seq']}")
+
+
+async def _propose_release(built: dict[str, Any], now: float) -> None:
+    secret = settings.action_signing_secret
+    if secret is None:
+        return
+    outdated = [ep for ep, v in INTEGRITY.items() if v.get("state") != "ok"]
+    known = [e["endpoint_id"] for e in activity.endpoints.values()]
+    sigs = [f"Release #{built['seq']}: changes {', '.join(built['changed']) or 'nothing (first release)'}",
+            f"{len(known)} endpoint(s) will update themselves when they're next online"]
+    if built["needs_installer"]:
+        sigs.append("requirements.txt changed: endpoints will need the installer for this one")
+    unsigned = PendingAction(
+        challenge_id=built["challenge_id"], endpoint_id="all-endpoints", action="deploy_release",
+        target_ip=None, threat_score=0, attack_signatures=tuple(sigs), created_at=now,
+        expires_at=now + RELEASE_APPROVAL_SECONDS, hmac_sha256="", target_path=f"agent release #{built['seq']}",
+        target_sha256=hashlib.sha256(built["manifest_bytes"]).hexdigest())
+    action = replace(unsigned, hmac_sha256=sign_action(secret.get_secret_value().encode(), unsigned.signing_payload()))
+    async with PENDING_LOCK:
+        PENDING[action.challenge_id] = action
+    DEPLOY["proposal"] = built
+    DEPLOY["proposed_at"][built["digest"]] = now
+    activity.record("release_proposed", seq=built["seq"], changed=built["changed"], challenge=action.challenge_id[:8])
+    log.warning("deployer: release #%d proposed (%s), waiting for your passkey", built["seq"], ", ".join(built["changed"]))
+    link = f"{settings.webauthn_origin.rstrip('/')}/warden/approve/{action.challenge_id}"
+    await _post_discord({"embeds": [{
+        "title": f"📦 New agent build: release #{built['seq']}",
+        "color": 0x8B5CF6,
+        "description": (f"Changed: {', '.join(f'`{_safe_md(c, 40)}`' for c in built['changed']) or 'nothing'}.\n"
+                        f"Approve with your passkey and each endpoint updates itself the next time it's online. "
+                        f"Every endpoint checks your passkey's signature itself before installing.\n\n{link}"),
+        "fields": [{"name": "Endpoints", "value": str(len(known)), "inline": True},
+                   {"name": "Not on the current build", "value": str(len(outdated)), "inline": True},
+                   {"name": "Request expires", "value": f"<t:{int(action.expires_at)}:R>", "inline": True}],
+    }]}, "release proposal")
+
+
+async def _approve_release(action: PendingAction, assertion: WebAuthnAssertion,
+                           approval: dict[str, Any]) -> ExecutionOrder:
+    prop = DEPLOY.get("proposal")
+    if (not prop or prop["challenge_id"] != action.challenge_id
+            or hashlib.sha256(prop["manifest_bytes"]).hexdigest() != action.target_sha256):
+        raise HTTPException(status.HTTP_409_CONFLICT, "this release is no longer the one waiting for approval")
+    who = approval.get("credential_label") or approval["method"]
+    rel = await asyncio.to_thread(releases.approve, prop, assertion.model_dump(), who)
+    DEPLOY["proposal"] = None
+    DEPLOY["status"] = f"rolling out release #{rel['seq']}"
+    activity.record("release_approved", seq=rel["seq"], changed=prop["changed"], approved_by=who)
+    log.warning("deployer: release #%d APPROVED by %s", rel["seq"], who)
+    await _post_discord({"embeds": [{
+        "title": f"✅ Release #{rel['seq']} approved",
+        "color": 0x16A34A,
+        "description": "Endpoints install it the next time they check in (within about 5 minutes while online).",
+    }]}, "release approval notice")
+    return ExecutionOrder(order={"order_id": f"release-{rel['seq']}", "action": "deploy_release",
+                                 "target_ip": None, "seq": rel["seq"]},
+                          payload_b64url="", signature_b64url="", key_id="")
+
+
+@app.get("/releases/current")
+async def releases_current(endpoint_id: str = Query(pattern=r"^[A-Za-z0-9._-]{1,64}$"),
+                           ident: ShipperIdentity = Depends(require_shipper_token)) -> dict:
+    """The approved release. The endpoint verifies your passkey's signature on it itself."""
+    ident.check(endpoint_id)
+    ep = endpoint_id.lower()
+    rate_limit("releases", ep)
+    ROLLOUT.setdefault(ep, {})["checked_at"] = time.time()
+    return {"release": releases.current}
+
+
+@app.get("/releases/{seq}/files/{name}")
+async def releases_file(seq: int, name: str, endpoint_id: str = Query(pattern=r"^[A-Za-z0-9._-]{1,64}$"),
+                        ident: ShipperIdentity = Depends(require_shipper_token)) -> Response:
+    ident.check(endpoint_id)
+    rate_limit("release_files", endpoint_id.lower())
+    if name not in RELEASE_FILES:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "not a release file")
+    data = await asyncio.to_thread(releases.file, seq, name)
+    if data is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such file in the current release")
+    return Response(data, media_type="application/octet-stream", headers={"Cache-Control": "no-store"})
+
+
+class ReleaseReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    endpoint_id: str = Field(pattern=r"^[A-Za-z0-9._-]{1,64}$")
+    seq: int = Field(ge=0, le=10_000_000)
+    status: Literal["applied", "up_to_date", "rolled_back", "needs_installer", "rejected", "failed"]
+    detail: str = Field(default="", max_length=500)
+
+
+@app.post("/releases/report")
+async def releases_report(rep: ReleaseReport, ident: ShipperIdentity = Depends(require_shipper)) -> dict:
+    ident.check(rep.endpoint_id)
+    ep = rep.endpoint_id.lower()
+    rate_limit("release_report", ep)
+    prev = ROLLOUT.get(ep) or {}
+    ROLLOUT[ep] = {**prev, "seq": rep.seq, "status": rep.status, "detail": rep.detail, "at": time.time()}
+    if (prev.get("seq"), prev.get("status")) == (rep.seq, rep.status):
+        return {"ok": True}
+    activity.record("release_" + rep.status, endpoint_id=ep, seq=rep.seq, detail=rep.detail)
+    log.log(logging.WARNING if rep.status in ("rolled_back", "rejected", "failed") else logging.INFO,
+            "deployer: %s release #%d: %s %s", ep, rep.seq, rep.status, rep.detail)
+    title, color = {
+        "applied": (f"⬆️ {ep} updated to release #{rep.seq}", 0x16A34A),
+        "rolled_back": (f"↩️ {ep} rolled back release #{rep.seq}", 0xDC2626),
+        "needs_installer": (f"🧰 {ep} needs the installer for release #{rep.seq}", 0xF59E0B),
+        "rejected": (f"🚨 {ep} refused release #{rep.seq}", 0xDC2626),
+        "failed": (f"⚠️ {ep} couldn't install release #{rep.seq}", 0xF59E0B),
+    }.get(rep.status, (None, 0))
+    if title:
+        await _post_discord({"embeds": [{"title": title, "color": color,
+                                         "description": _safe_md(rep.detail, 400) or None}]}, "release report")
+    return {"ok": True}
+
+
+def _deployer_view() -> dict[str, Any]:
+    cur = releases.current
+    prop = DEPLOY.get("proposal")
+    pend = PENDING.get(prop["challenge_id"]) if prop else None
+    return {
+        "status": DEPLOY["status"], "last_tick": DEPLOY["last_tick"],
+        "current": {k: cur[k] for k in ("seq", "approved_at", "approved_by")} if cur else None,
+        "proposal": {"seq": prop["seq"], "changed": prop["changed"], "challenge_id": prop["challenge_id"],
+                     "expires_at": pend.expires_at if pend else None} if prop else None,
+        "endpoints": {e["endpoint_id"]: {**(ROLLOUT.get(e["endpoint_id"]) or {}),
+                                         "code": (INTEGRITY.get(e["endpoint_id"]) or {}).get("state")}
+                      for e in activity.endpoints.values()},
+    }
 
 
 def _integrity_view() -> dict[str, Any]:
@@ -2213,6 +2407,11 @@ async def warden_deny(challenge_id: str) -> dict:
                     action=action.action, target_ip=action.target_ip, target_path=action.target_path,
                     threat_score=action.threat_score, test=action.endpoint_id == testlab.TEST_ENDPOINT)
     _test_followup(challenge_id, "denied", "denied by you")
+    if action.action == "deploy_release":
+        prop = DEPLOY.get("proposal")
+        if prop and prop["challenge_id"] == challenge_id:
+            releases.set_denied(prop["digest"])
+            DEPLOY["proposal"] = None
     if action.endpoint_id != testlab.TEST_ENDPOINT:
         now = time.time()
         for k in [k for k, until in RECENT_DENIALS.items() if until <= now]:
@@ -2268,7 +2467,10 @@ def static_css() -> Response:
 def warden_public_key() -> dict:
     """The key enforcers use to check execution orders. Pin it on the endpoint
     out-of-band; fetching it at runtime over the network would let a MITM swap it."""
-    return {"alg": "Ed25519", "key_id": rt.exec_key_id, "public_key_b64url": rt.exec_pub_b64url}
+    return {"alg": "Ed25519", "key_id": rt.exec_key_id, "public_key_b64url": rt.exec_pub_b64url,
+            # For agent self-updates: endpoints only install a release one of these passkeys signed.
+            "passkeys": passkeys.public_keys() if settings.warden_assertion_mode == "webauthn" else [],
+            "origin": settings.webauthn_origin.rstrip("/"), "rp_id": settings.webauthn_rp_id}
 
 
 @app.get("/healthz")
@@ -2593,6 +2795,7 @@ async def dashboard_summary(session: dict = Depends(require_dashboard)) -> Respo
         "watch": _watch_view(now),
         "intel": intel.status(),
         "integrity": _integrity_view(),
+        "deployer": _deployer_view(),
         "audit": audit.status(),
         "token_kind": dict(TOKEN_KIND),
         "strict_tokens": settings.strict_endpoint_tokens,
@@ -2606,5 +2809,15 @@ async def dashboard_summary(session: dict = Depends(require_dashboard)) -> Respo
         },
         **snap,
     }
+    body["agents"] = {**body.get("agents", {}), "deployer": {"busy": None, "last": None, "stats": {
+        "release": (releases.current or {}).get("seq") or 0,
+        "current": sum(1 for v in body["deployer"]["endpoints"].values() if v.get("code") == "ok"),
+        "behind": sum(1 for v in body["deployer"]["endpoints"].values() if v.get("code") not in ("ok", None))}}}
     return Response(json.dumps(body, default=str), media_type="application/json",
                     headers={"Cache-Control": "no-store"})
+
+
+@app.post("/dashboard/api/releases/propose", dependencies=[Depends(_dashboard_post_guard), Depends(require_dashboard)])
+async def dashboard_propose_release() -> dict:
+    """Ask for a release now, even if you denied this build before."""
+    return {"status": await _deployer_tick(force=True)}

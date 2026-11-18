@@ -43,6 +43,12 @@ Agent self-check: every ~10 min (and at start) the shipper reports the SHA-256 o
 its own files to the Hub (POST /integrity), which alerts if they don't match any
 version it shipped.
 
+Self-update (see updater.py): about every 5 minutes the shipper asks the Hub for
+the current release and installs it only if your passkey signed it. Needs
+agent_launcher.py (the scheduled task runs it), which restarts the agent on the
+new version and rolls it back if it doesn't come up healthy.
+  SOC_AUTO_UPDATE     1 (default) or 0
+
 Enforcement (see enforcer.py): each cycle the shipper also asks the Hub for
 approved execution orders, verifies their Ed25519 signature against the pinned
 Hub key, and applies them as Windows Firewall rules.
@@ -124,7 +130,12 @@ TAILSCALE_CLI = (os.environ.get("SOC_TAILSCALE_CLI") or _CFG.get("tailscale_cli"
                  or (r"C:\Program Files\Tailscale\tailscale.exe" if IS_WINDOWS else "tailscale"))
 PRESENCE_EVERY = 6          # cycles (~60 s)
 INTEGRITY_EVERY = 60        # cycles (~10 min)
-AGENT_FILES = ("shipper.py", "enforcer.py", "sysmon.py", "winlog.py", "sysmon-config.xml")
+UPDATE_EVERY = 30           # cycles (~5 min)
+AUTO_UPDATE = os.environ.get("SOC_AUTO_UPDATE", "1") != "0"
+LAUNCHER_PID = int(os.environ.get("SOC_LAUNCHER_PID") or 0)
+HUB_OK = False              # talked to the Hub successfully since this process started
+AGENT_FILES = ("shipper.py", "enforcer.py", "sysmon.py", "winlog.py", "updater.py", "agent_launcher.py",
+               "sysmon-config.xml")
 TOKEN_FILE = os.environ.get("SOC_TOKEN_FILE", DEFAULT_TOKEN_FILE)
 INTERVAL = max(1.0, float(os.environ.get("SOC_INTERVAL", "10")))
 INCLUDE_CMDLINE = os.environ.get("SOC_INCLUDE_CMDLINE", "1") != "0"
@@ -346,6 +357,8 @@ class Sender:
             log.warning("hub unreachable: %s", getattr(exc, "reason", exc))
             return False, True
 
+        global HUB_OK
+        HUB_OK = True
         level = logging.WARNING if result.get("challenge_ids") else logging.INFO
         log.log(level, "sent %d events: score=%s decision=%s", len(events),
                 result.get("threat_score"), result.get("decision"))
@@ -462,12 +475,14 @@ def agent_manifest() -> dict:
 
 
 def report_integrity(token: str) -> None:
+    global HUB_OK
     body = json.dumps({"endpoint_id": ENDPOINT_ID, "files": agent_manifest()}).encode()
     req = urllib.request.Request(hub_base_url() + "/integrity", data=body, method="POST",
                                  headers={"Content-Type": "application/json", "X-SOC-Token": token})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
             state = json.loads(resp.read() or b"{}").get("state")
+        HUB_OK = True
         if state not in ("ok", None):
             log.warning("self-check: the Hub says this agent's code is %s", state)
     except urllib.error.HTTPError as exc:
@@ -514,6 +529,18 @@ def run(dry_run: bool) -> None:
     if IS_WINDOWS and os.environ.get("SOC_WINLOG", "1") != "0":
         from winlog import WinLogReader
         logs = WinLogReader(STATE_DIR, include_cmdline=INCLUDE_CMDLINE)
+    upd = None
+    if AUTO_UPDATE:
+        try:
+            import updater
+            upd = updater.Updater(hub_base_url=hub_base_url(), token=token, endpoint_id=ENDPOINT_ID,
+                                  state_dir=STATE_DIR, install_dir=Path(__file__).resolve().parent,
+                                  pin_file=HUB_KEY_FILE)
+        except ImportError as exc:
+            log.error("self-update disabled: %s", exc)
+    started_at = time.monotonic()
+    update_pending = bool(upd and upd.pending())
+    restart = False
     lower_priority()
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
@@ -549,6 +576,21 @@ def run(dry_run: bool) -> None:
                 report_integrity(token)
             except Exception:
                 log.exception("self-check report crashed")
+        if LAUNCHER_PID and not psutil.pid_exists(LAUNCHER_PID):
+            log.warning("agent_launcher.py is gone (task stopped?); exiting")
+            break
+        if update_pending:   # a just-installed release: tell the launcher it works
+            up = time.monotonic() - started_at
+            if up >= 60 and (HUB_OK or (up >= 180 and not tailscale_is_up())):
+                upd.mark_healthy()
+                update_pending = False
+        if upd is not None and not update_pending and cycle % UPDATE_EVERY == 3 and tailscale_is_up():
+            try:
+                if upd.check(under_launcher=bool(LAUNCHER_PID)):
+                    restart = True
+                    break
+            except Exception:   # never let updating kill telemetry
+                log.exception("update check crashed")
         if REPORT_PRESENCE and cycle % PRESENCE_EVERY == 0 and tailscale_is_up():
             try:
                 report_presence(token)
@@ -569,6 +611,8 @@ def run(dry_run: bool) -> None:
             delay = 0
         stop.wait(delay)
     log.info("stopped")
+    if restart:
+        sys.exit(75)   # updater.RESTART_CODE: agent_launcher.py starts the new version
 
 
 def main() -> None:
@@ -608,6 +652,8 @@ def main() -> None:
                          "e.g. https://soc-hub.your-tailnet.ts.net/warden/public-key")
             key = enforcer.pin_hub_key(HUB_KEY_URL, HUB_KEY_FILE)
             print(f"Pinned Hub key_id {key.key_id} to {HUB_KEY_FILE}")
+            pk = json.loads(HUB_KEY_FILE.read_text(encoding="utf-8")).get("passkeys") or []
+            print(f"Pinned {len(pk)} passkey(s) that can approve agent updates")
             print("Check it matches the Hub log line 'execution orders are signed with "
                   "Ed25519 key_id=...'")
         elif args.list_blocks:

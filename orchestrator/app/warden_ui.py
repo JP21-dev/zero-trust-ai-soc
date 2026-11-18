@@ -174,8 +174,10 @@ async function loadPending() {
     $("d-endpoint").textContent = p.endpoint_id;
     $("d-action").textContent = p.action;
     $("d-target").textContent = p.action === "quarantine_file"
-      ? p.target_path + " (sha256 " + String(p.target_sha256).slice(0, 12) + "…)" : (p.target_ip || "none identified");
-    $("d-score").textContent = p.threat_score + " / 100";
+      ? p.target_path + " (sha256 " + String(p.target_sha256).slice(0, 12) + "…)"
+      : p.action === "deploy_release" ? p.target_path + " (manifest " + String(p.target_sha256).slice(0, 12) + "…)"
+      : (p.target_ip || "none identified");
+    $("d-score").textContent = p.action === "deploy_release" ? "— (agent update)" : p.threat_score + " / 100";
     const ul = $("d-sigs");
     ul.replaceChildren(...(p.attack_signatures.length ? p.attack_signatures : ["—"]).map((s) => {
       const li = document.createElement("li"); li.textContent = s; return li;
@@ -221,8 +223,10 @@ async function approve() {
         user_handle: r.userHandle && r.userHandle.byteLength ? enc(r.userHandle) : null,
       },
     });
-    lock("Approved. Signed order " + res.order.order_id + " for " + res.order.action
-         + " " + (res.order.target_ip || "") + ".", "ok");
+    lock(res.order.action === "deploy_release"
+      ? "Approved release #" + res.order.seq + ". Endpoints install it the next time they check in."
+      : "Approved. Signed order " + res.order.order_id + " for " + res.order.action
+        + " " + (res.order.target_ip || "") + ".", "ok");
   } catch (e) {
     if (e.name === "NotAllowedError") {
       // The browser prompt was cancelled before anything was sent: still pending.
