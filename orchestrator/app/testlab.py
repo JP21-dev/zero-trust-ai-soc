@@ -177,7 +177,8 @@ def _spoof_checks(runs, thr, discord):
 
 def _sysmon(event_type: str, process: str, exe: str, **kw: Any) -> dict[str, Any]:
     e = _ev(process, exe, None, None, cmdline=kw.pop("cmdline", None), user=kw.pop("user", "SOC-TEST-LAB\\analyst"))
-    e.update(event_type=event_type, dst_ip=None, dst_port=None, protocol=None, **kw)
+    e.update(dst_ip=None, dst_port=None, protocol=None)
+    e.update(event_type=event_type, **kw)
     return e
 
 
@@ -250,6 +251,117 @@ def _lsass_checks(runs, thr, discord):
         escalated(st, thr),
         check("Warden proposed quarantining the tool, never lsass.exe itself",
               tf.get("path", "").lower().endswith("procdump64.exe"), str(tf.get("path"))),
+    ]
+
+
+def _defender_batches():
+    return [[
+        _sysmon("defender", "powershell.exe", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                rule="exclusion_added", object_name=r"C:\Users\analyst\AppData\Local\Temp",
+                file_path=r"C:\Users\analyst\AppData\Local\Temp",
+                detail=r"HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths\C:\Users\analyst\AppData\Local\Temp = 0x0"),
+        _sysmon("defender", "MsMpEng.exe", r"C:\ProgramData\Microsoft\Windows Defender\Platform\MsMpEng.exe",
+                rule="realtime_off", object_name="Real-time protection turned off", detail="Defender event 5001"),
+    ]]
+
+
+def _defender_checks(runs, thr, discord):
+    st = runs[0]
+    return [
+        check("Strategist flagged Defender's real-time protection being turned off", "defender_disabled" in _flags(st)),
+        check("…and a new Defender exclusion for the Temp folder", "defender_exclusion" in _flags(st)
+              and "suspicious_location" in _flags(st)),
+        escalated(st, thr),
+        check("Warden asks for a review (nothing to block or quarantine)", not st.get("target_file")
+              and not st.get("target_ip")),
+    ]
+
+
+def _dns_batches():
+    exe = r"C:\Users\analyst\AppData\Local\Temp\svc_update.exe"
+    return [[_sysmon("dns", "svc_update.exe", exe, sha256=_fake_sha(), domain="beacon.c2-test.soc.invalid",
+                     dst_ip="203.0.113.77", detail="203.0.113.77")]]
+
+
+def _dns_checks(runs, thr, discord):
+    st = runs[0]
+    return [
+        check("Strategist matched the domain against threat intel (built-in test domain)",
+              "malicious_domain" in _flags(st)),
+        escalated(st, thr),
+        check("Warden proposes blocking the address the domain resolved to", st.get("target_ip") == "203.0.113.77",
+              str(st.get("target_ip"))),
+    ]
+
+
+def _service_batches():
+    return [[_sysmon("service", "cmd.exe", r"C:\Windows\System32\cmd.exe", object_name="WinSvcHelper",
+                     cmdline=("%COMSPEC% /b /c start /b /min powershell -nop -w hidden -enc "
+                              "SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIAA="),
+                     detail="auto start, runs as LocalSystem")]]
+
+
+def _service_checks(runs, thr, discord):
+    st = runs[0]
+    return [
+        check("Strategist flagged a new service (persistence)", "startup_persistence" in _flags(st)),
+        check("…that runs cmd.exe, the classic remote-admin-tool pattern", "script_service" in _flags(st)),
+        check("…with a hidden, encoded PowerShell command", "obfuscated_command" in _flags(st)),
+        escalated(st, thr),
+        check("Warden never proposes quarantining Windows' own cmd.exe", not st.get("target_file")),
+    ]
+
+
+def _task_batches():
+    exe = r"C:\Users\analyst\AppData\Local\Temp\winupdate.exe"
+    return [[_sysmon("task", "winupdate.exe", exe, sha256=_fake_sha(), object_name=r"\WindowsUpdateCheck",
+                     cmdline=exe + " /silent")]]
+
+
+def _task_checks(runs, thr, discord):
+    st = runs[0]
+    tf = st.get("target_file") or {}
+    return [
+        check("Strategist flagged a new scheduled task (persistence)", "startup_persistence" in _flags(st)),
+        check("…running a program from the Temp folder", "suspicious_location" in _flags(st)),
+        escalated(st, thr),
+        check("Warden proposed quarantining the program the task runs",
+              tf.get("path", "").lower().endswith("winupdate.exe"), str(tf.get("path"))),
+    ]
+
+
+def _logon_batches():
+    return [[_sysmon("logon", "windows-security", None, count=27, dst_ip="198.51.100.45",
+                     object_name="administrator, admin, analyst", detail="logon type 3 (network)", user=None)]]
+
+
+def _logon_checks(runs, thr, discord):
+    st = runs[0]
+    return [
+        check("Strategist flagged 27 failed logins as password guessing", "password_guessing" in _flags(st)),
+        escalated(st, thr),
+        check("Warden proposes blocking the address the guesses came from", st.get("target_ip") == "198.51.100.45",
+              str(st.get("target_ip"))),
+    ]
+
+
+def _account_batches():
+    return [[
+        _sysmon("account", "windows-security", None, rule="account_created", object_name="support_svc",
+                user="SOC-TEST-LAB\\analyst"),
+        _sysmon("account", "windows-security", None, rule="admin_added", object_name="support_svc",
+                detail="Administrators (S-1-5-32-544)", user="SOC-TEST-LAB\\analyst"),
+    ]]
+
+
+def _account_checks(runs, thr, discord):
+    st = runs[0]
+    return [
+        check("Strategist flagged the new local account", "account_created" in _flags(st)),
+        check("…being added to Administrators", "admin_added" in _flags(st)),
+        escalated(st, thr),
+        check("Warden asks for a review (nothing to block or quarantine)", not st.get("target_file")
+              and not st.get("target_ip")),
     ]
 
 
@@ -428,6 +540,30 @@ SCENARIOS: dict[str, Scenario] = {s.id: s for s in [
              "A dump tool from Downloads opens lsass.exe, where Windows keeps passwords (Sysmon event 10).",
              ("strategist", "warden"), _lsass_batches, _lsass_checks,
              expected="Credential theft → quarantine the tool"),
+    Scenario("defender_off", "Defender turned off", "🛡️",
+             "Real-time protection switched off and the Temp folder excluded from scans (Defender log).",
+             ("strategist", "warden"), _defender_batches, _defender_checks,
+             expected="Defender disabled + exclusion → Warden pauses for review"),
+    Scenario("malicious_dns", "Malware domain lookup", "🌐",
+             "A program in Temp looks up a known command-and-control domain (Sysmon DNS event).",
+             ("strategist", "warden"), _dns_batches, _dns_checks,
+             expected="Threat-intel match → block the address it resolved to"),
+    Scenario("service_install", "Malicious service", "⚙️",
+             "A new service that runs cmd.exe → hidden PowerShell, like remote-admin attack tools do (System log).",
+             ("strategist", "warden"), _service_batches, _service_checks,
+             expected="Service persistence + script host + hidden command → Warden pauses"),
+    Scenario("task_persist", "Scheduled-task persistence", "⏰",
+             "A new scheduled task runs a program from the Temp folder (Security log 4698).",
+             ("strategist", "warden"), _task_batches, _task_checks,
+             expected="Task persistence + Temp folder → quarantine proposed"),
+    Scenario("password_guessing", "Password guessing", "🔐",
+             "27 failed logins in 10 minutes from one address (Security log 4625).",
+             ("strategist", "warden"), _logon_batches, _logon_checks,
+             expected="Brute force → block the attacker's address"),
+    Scenario("new_admin", "New admin account", "👤",
+             "A new local account is created and added to Administrators (Security log 4720 + 4732).",
+             ("strategist", "warden"), _account_batches, _account_checks,
+             expected="New account + admin rights → Warden pauses for review"),
     Scenario("normal_apps", "Normal apps (false-alarm check)", "🎵",
              "Spotify, Discord and VS Code making new connections.",
              ("strategist", "warden"), _normal_batches, _normal_checks,

@@ -14,8 +14,11 @@
     3. Installs the shipper token and config.json (Hub URLs) in C:\ProgramData\SOCShipper
        (SYSTEM + Admins only).
     4. Pins the Hub's order-signing public key over HTTPS and checks its key_id.
-    5. Does one dry run (prints a batch, sends nothing).
-    6. Registers the "SOCShipper" scheduled task: at startup, as SYSTEM, restarts on
+    5. Installs or updates Microsoft Sysmon (asks first), and turns on the Windows audit
+       logging the rules read: failed logins, account and group changes, new
+       scheduled tasks.
+    6. Does one dry run (prints a batch, sends nothing).
+    7. Registers the "SOCShipper" scheduled task: at startup, as SYSTEM, restarts on
        failure, and starts it now.
 
   Safe to re-run: it updates the files and restarts the task.
@@ -83,7 +86,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $CheckOnly -and -not $isAdmin) {
     Fail "Run this from an elevated PowerShell (right-click PowerShell > Run as administrator)."
 }
-foreach ($f in "shipper.py", "enforcer.py", "sysmon.py", "sysmon-config.xml", "requirements.txt") {
+foreach ($f in "shipper.py", "enforcer.py", "sysmon.py", "winlog.py", "sysmon-config.xml", "requirements.txt") {
     if (-not (Test-Path (Join-Path $here $f))) { Fail "$f not found next to this script ($here)." }
 }
 
@@ -125,7 +128,7 @@ $venvPy  = Join-Path $InstallDir ".venv\Scripts\python.exe"
 $venvPyw = Join-Path $InstallDir ".venv\Scripts\pythonw.exe"
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($CheckOnly) {
-    Info "Would copy shipper.py, enforcer.py, sysmon.py, sysmon-config.xml, requirements.txt and build a venv."
+    Info "Would copy shipper.py, enforcer.py, sysmon.py, winlog.py, sysmon-config.xml, requirements.txt and build a venv."
     Info ("Existing install: " + $(if (Test-Path $venvPy) { "yes (will be updated)" } else { "no" }))
     Info ("Scheduled task '$TaskName': " + $(if ($task) { $task.State } else { "not registered" }))
 } else {
@@ -142,7 +145,7 @@ if ($CheckOnly) {
         icacls (Join-Path $InstallDir "*") /reset /T /C /Q | Out-Null
         if ($LASTEXITCODE) { Fail "Couldn't reset permissions inside $InstallDir (icacls exit $LASTEXITCODE)." }
     }
-    Copy-Item (Join-Path $here "shipper.py"), (Join-Path $here "enforcer.py"), (Join-Path $here "sysmon.py"), (Join-Path $here "sysmon-config.xml"), (Join-Path $here "requirements.txt") $InstallDir -Force -ErrorAction Stop
+    Copy-Item (Join-Path $here "shipper.py"), (Join-Path $here "enforcer.py"), (Join-Path $here "sysmon.py"), (Join-Path $here "winlog.py"), (Join-Path $here "sysmon-config.xml"), (Join-Path $here "requirements.txt") $InstallDir -Force -ErrorAction Stop
     if (-not (Test-Path (Join-Path $InstallDir ".venv\pyvenv.cfg"))) {
         & $py.Path -m venv --clear (Join-Path $InstallDir ".venv"); if ($LASTEXITCODE) { Fail "venv creation failed." }
     }
@@ -258,7 +261,7 @@ else {
 }
 
 # ------------------------------------------------------------------ 5. Sysmon
-Step 5 "Microsoft Sysmon (file and process visibility)"
+Step 5 "Microsoft Sysmon and Windows audit logging"
 $sysmonCfg = Join-Path $InstallDir "sysmon-config.xml"
 $svc = Get-Service -Name Sysmon64, Sysmon -ErrorAction SilentlyContinue | Select-Object -First 1
 $installedExe = if ($svc) { Join-Path $env:windir ($svc.Name + ".exe") } else { $null }
@@ -302,6 +305,25 @@ if ($SkipSysmon) {
         }
     }
 }
+# Windows' own audit log: what the failed-login, new-account/admin and new-task rules read.
+# By GUID, because the category names are translated on non-English Windows.
+$audit = @(
+    @("Logon (failures)",          "{0CCE9215-69AE-11D9-BED3-505054503030}", "/failure:enable"),
+    @("User account management",   "{0CCE9235-69AE-11D9-BED3-505054503030}", "/success:enable"),
+    @("Security group management", "{0CCE9237-69AE-11D9-BED3-505054503030}", "/success:enable"),
+    @("Scheduled tasks (other object access)", "{0CCE9227-69AE-11D9-BED3-505054503030}", "/success:enable")
+)
+if ($CheckOnly) {
+    Info ("Would turn on Windows audit logging for: " + (($audit | ForEach-Object { $_[0] }) -join ", ") + ".")
+} else {
+    $failed = @()
+    foreach ($a in $audit) {
+        & auditpol.exe /set "/subcategory:$($a[1])" $a[2] | Out-Null
+        if ($LASTEXITCODE) { $failed += $a[0] }
+    }
+    if ($failed) { Info "Warning: couldn't turn on audit logging for $($failed -join ', ') (a Group Policy may manage it)." }
+    else { Ok ("Audit logging on: " + (($audit | ForEach-Object { $_[0] }) -join ", ") + ".") }
+}
 
 # ------------------------------------------------------------------ 6. Dry run
 Step 6 "Dry run (reads connections, sends nothing)"
@@ -311,12 +333,15 @@ else {
     # stderr; merged, their order isn't guaranteed, so search all of it for the summary.
     $dryOut = (& $venvPy (Join-Path $InstallDir "shipper.py") --dry-run 2>&1 | ForEach-Object { "$_" }) -join "`n"
     if ($LASTEXITCODE) { Fail "Dry run failed:`n$($dryOut.Substring([Math]::Max(0, $dryOut.Length - 600)))" }
-    $summary = [regex]::Match($dryOut, "# \d+ events?, tailscale_up=(True|False)(, sysmon=\w+)?")
+    $summary = [regex]::Match($dryOut, "# \d+ events?, tailscale_up=(True|False)(, sysmon=\w+)?(, winlog=[\w:,]+)?")
     if (-not $summary.Success) { Fail "Dry run gave no summary line:`n$($dryOut.Substring([Math]::Max(0, $dryOut.Length - 600)))" }
     if ($summary.Groups[1].Value -ne "True") { Fail "Tailscale doesn't look connected ($($summary.Value)). Connect it and re-run." }
     Ok $summary.Value.TrimStart("# ")
     if (-not $SkipSysmon -and $summary.Value -match "sysmon=unreadable") {
         Info "Warning: Sysmon's event log isn't readable yet; file/process events will start once it is."
+    }
+    if ($summary.Value -match "winlog=[\w:,]*unreadable") {
+        Info "Note: some Windows logs aren't readable from this PowerShell; the scheduled task runs as SYSTEM, which can read them."
     }
 }
 

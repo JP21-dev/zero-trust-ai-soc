@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     # Per-endpoint tokens: when true, the shared shipper token is refused and every
     # endpoint must use its own token (python -m app.tokens issue <endpoint_id>).
     strict_endpoint_tokens: bool = False
+    # The Hub's read-only copy of the shipper folder, for the agent self-check (agentcheck.py).
+    agent_release_dir: Path = Path("/app/shipper_release")
 
     @property
     def abusech_auth_key(self) -> str | None:

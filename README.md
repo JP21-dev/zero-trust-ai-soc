@@ -63,6 +63,12 @@ through the real pipeline and posts pass/fail to Discord.
   LSASS password-theft attempts, code injection, unsigned drivers and process tampering.
   Rules catch known-malware fingerprints (EICAR, your own list, and abuse.ch MalwareBazaar
   with a free key), double extensions like `.pdf.exe`, and Office apps launching scripts.
+- **Defender, DNS and account watch.** Alerts when Microsoft Defender is turned off or given
+  an exclusion, checks every domain lookup against abuse.ch ThreatFox (malware/phishing
+  domains and command-and-control servers), and reads Windows' own logs for new services,
+  new scheduled tasks, password guessing, new local accounts and new administrators.
+- **Agent self-check.** Each endpoint reports a fingerprint of its own code; the Hub alerts
+  in Discord if it doesn't match any version the Hub shipped.
 - **Passkey-approved quarantine.** For a malicious file the Warden proposes a quarantine; once
   you approve, the endpoint moves the file only if its fingerprint still matches, never
   touches `C:\Windows` or Program Files, and can restore it (`shipper.py --restore`).
@@ -75,10 +81,11 @@ through the real pipeline and posts pass/fail to Discord.
   as unprotected on the dashboard.
 - **Zero-trust networking.** Everything is reachable only over your Tailscale tailnet. The
   vector DB has no network egress at all. Containers are read-only, non-root, no capabilities.
-- **Dashboard + test lab.** 14 attack scenarios (prompt injection, masquerading, plain
+- **Dashboard + test lab.** 20 attack scenarios (prompt injection, masquerading, plain
   malware, hidden PowerShell, fake svchost, known-malware download, Office macro, auto-start
-  persistence, LSASS password theft, memory, full attack chain, and false-alarm checks; see
-  the [Threat catalog](#threat-catalog)), with results posted to Discord. A live window follows each test attack through
+  persistence, LSASS password theft, Defender turned off, malware domain lookup, malicious
+  service, scheduled-task persistence, password guessing, new admin account, memory, full
+  attack chain, and false-alarm checks; see the [Threat catalog](#threat-catalog)), with results posted to Discord. A live window follows each test attack through
   the agents step by step, showing how it's read and stopped, and lets you approve or deny
   it right there.
 
@@ -92,8 +99,10 @@ test-lab scenario that proves it works.
 The Strategist takes the worst event in the batch and adds **+40** for a prompt injection,
 **+30** for a masquerade or spoofed identity (+15 for a weaker one) and **+20** if the
 Detective has never seen it before, capped at 90. At **85 or more** the Warden stops
-everything and asks for your passkey. Below that it's logged, and learned as normal only if
-nothing was flagged. Gemini, when enabled, can raise a score but never lower it.
+everything and asks for your passkey; below 85 it's logged, and learned as normal only if
+nothing was flagged. Flagged events are never learned, so they always get the +20: a
+single red flag worth **65 or more** alerts on its own. Gemini, when enabled, can raise a
+score but never lower it.
 
 **What happens after you approve:** a malicious connection gets a **firewall block** on that
 endpoint; a malicious file gets **quarantined** (moved to a locked folder, restorable); anything
@@ -106,6 +115,9 @@ else gets a **review alert** with no automatic action.
 | Command-and-control (C2) on attacker ports | A new program calling out on 4444 (Metasploit), 1337, 50050 (Cobalt Strike), 9050 (Tor), IRC botnet or miner-pool ports | `attacker_port` | 30 | Plain malware |
 | Windows admin tools on the internet ("living off the land") | `powershell`, `certutil`, `mshta`, `rundll32`, `regsvr32`, `bitsadmin` and other built-in tools making outside connections | `lolbin_network` | 20 | Hidden PowerShell |
 | Downloads from a bare IP address | A command line fetching `http://203.0.113.5/...` instead of a domain | `raw_ip_download` | 20 | |
+| Known command-and-control servers | A connection to an IP:port that abuse.ch ThreatFox lists as a botnet/RAT controller (any port on that IP: `c2_host`, 50) | `known_c2` | 90 | |
+| Malware and phishing domains | Any program looking up a domain ThreatFox lists, or a subdomain of one (Sysmon DNS) | `malicious_domain` | 90 | Malware domain lookup |
+| Short connections | Admin tools, risky-folder programs or attacker ports connecting for less than the 10 s sampling interval are still seen (Sysmon network) | the rules above | | |
 
 ### Programs and commands
 
@@ -129,6 +141,9 @@ else gets a **review alert** with no automatic action.
 | Threat | Example | Rule | Points | Test lab |
 |---|---|---|---|---|
 | Auto-start entries | A new value under the registry `Run`/`RunOnce` keys, Winlogon `Userinit`/`Shell`, an Image File Execution Options debugger, or a file in the Startup folder | `startup_persistence` | 40 | Auto-start persistence |
+| New services | Any newly installed Windows service (System log 7045) | `startup_persistence` | 40 | Malicious service |
+| Services that run a shell | A new service running `cmd.exe`, PowerShell, `mshta`, `rundll32`… (how PsExec-style remote-admin attack tools work) | `script_service` | 45 | Malicious service |
+| New scheduled tasks | Any new task except Windows' own (Security log 4698); a task running a script host adds `script_task` (20) | `startup_persistence` | 40 | Scheduled-task persistence |
 
 ### Credentials and memory
 
@@ -138,6 +153,26 @@ else gets a **review alert** with no automatic action.
 | Code injection | A program starting a thread inside another process (`CreateRemoteThread`) | `code_injection` | 50 | |
 | Process hollowing / tampering | A running process's image replaced in memory | `process_tamper` | 50 | |
 | Unsigned kernel drivers | A driver without a valid signature being loaded (a common rootkit and "bring your own vulnerable driver" step) | `unsigned_driver` | 50 | |
+
+### Accounts and logins
+
+| Threat | Example | Rule | Points | Test lab |
+|---|---|---|---|---|
+| Password guessing | 10 or more failed logins in 10 minutes from one source (Security log 4625); from a network address, the Warden proposes blocking it | `password_guessing` | 70 | Password guessing |
+| Several failed logins | 3 or more in 10 minutes: shown, no alert | `failed_logins` | 20 | |
+| New local accounts | An account created on the machine (4720), a classic backdoor | `account_created` | 45 | New admin account |
+| New administrators | An account added to the local Administrators group (4732) | `admin_added` | 70 | New admin account |
+| New remote-desktop users | An account added to Remote Desktop Users (4732) | `rdp_user_added` | 45 | |
+
+### Microsoft Defender
+
+| Threat | Example | Rule | Points | Test lab |
+|---|---|---|---|---|
+| Defender turned off | Real-time protection, virus or spyware scanning, or Tamper Protection switched off, by a person or a policy (5001, 5010, 5012, 5007) | `defender_disabled` | 80 | Defender turned off |
+| Defender exclusions | A folder, file type or process excluded from scans (5007); an excluded Temp or Downloads folder also adds `suspicious_location` | `defender_exclusion` | 65 | Defender turned off |
+| Attempts to turn Defender off | Tamper Protection blocked a change to Defender's settings (5013) | `defender_tamper` | 65 | |
+| Defender detections | Defender found a threat or an attack-surface-reduction rule blocked something (1116, 1121); +25 if it's high or severe (`defender_severe`) | `defender_detection` | 45 | |
+| Threats Defender couldn't remove | Defender's cleanup failed (1118, 1119) | `defender_unresolved` | 80 | |
 
 ### Attacks on the AI and the SOC itself
 
@@ -153,26 +188,26 @@ else gets a **review alert** with no automatic action.
 | Flooding the Hub | Thousands of requests per second | Rate limits plus container CPU/memory/process caps | |
 | Rewriting the history | Editing the activity log to hide an incident | Hash-chained audit log, checked at startup, daily checkpoints in Discord | |
 | Killing the agent | Malware stopping the shipper on an endpoint | Silent-agent alert when Tailscale still shows the machine online | |
+| Tampering with the agent | Editing or deleting the shipper's code on an endpoint | Self-check: every ~10 min the agent reports its files' SHA-256; any version the Hub never shipped is a 🚨 Discord alert (an agent that's merely out of date is shown, not alerted). It catches casual tampering; an attacker already running as SYSTEM could fake the report | |
 
 ### Not covered yet
 
 Ideas for new rows. Pull requests welcome.
 
 - Ransomware-style mass file encryption or renames
-- Failed or unusual logins, new local admin accounts
 - USB storage devices
 - Lateral movement between your machines (SMB/RDP/WinRM)
-- New services and scheduled tasks
-- DNS lookups (e.g. newly registered or algorithm-generated domains)
+- Successful logins at unusual times or from new places
+- Newly registered or algorithm-generated (DGA) domains that aren't on a threat list yet
 
 ### Adding a threat
 
 1. **Make it visible.** If the endpoint doesn't send that kind of event yet, add it to
-   `shipper/sysmon-config.xml` and `shipper/sysmon.py` (or to the connection data in
-   `shipper/shipper.py`).
+   `shipper/sysmon-config.xml` and `shipper/sysmon.py`, to `shipper/winlog.py` for a
+   Windows event log, or to the connection data in `shipper/shipper.py`.
 2. **Write the rule.** In `orchestrator/app/main.py`, add a name, points and a plain-English
    description to `BEHAVIOR_POINTS` and the descriptions next to it, then set the flag in
-   `behavior_findings()`. Points are per event: give it 85+ only if it should alert on its own.
+   `behavior_findings()`. Points are per event: give it 65+ only if it should alert on its own.
 3. **Prove it.** Add a scenario to `orchestrator/app/testlab.py`, with checks for what each
    agent should do, and run it from **Test lab**. Run **Normal apps (false-alarm check)** too.
 4. **List it here** as a new row.
@@ -260,8 +295,10 @@ startup task. Add `-DryRunEnforcement` to log blocks without touching the firewa
 Be honest with yourself about what this does **not** do:
 
 - **Only what's in the [Threat catalog](#threat-catalog).** Without Sysmon it sees network
-  connections only. Even with Sysmon it doesn't see ransomware-style mass encryption, logins,
-  USB, or connections shorter than the 10 s sampling interval.
+  connections and Windows' own logs only (no DNS, files or short connections). It doesn't see
+  ransomware-style mass encryption or USB, and threat intel only knows what's already listed.
+- **Brand-new services and tasks from normal apps are shown, not alerted.** They only alert
+  with a second red flag (a risky folder, a shell, a hidden command).
 - **Most rules need two red flags to alert.** A program in `Program Files` calling out on
   port 443 looks like any normal app.
 - **Blocks are per endpoint and Windows-only.** A block on one machine doesn't protect
@@ -285,12 +322,15 @@ orchestrator/app/
   dashboard_*.py          Dashboard pages, passkey sign-in
   testlab.py              Test-attack scenarios
   activity.py             History for the dashboard
-  intel.py                Known-malware fingerprints (EICAR, custom list, MalwareBazaar)
+  intel.py                Threat intel: file fingerprints (EICAR, custom, MalwareBazaar),
+                          domains and C2 servers (ThreatFox)
+  agentcheck.py           Agent self-check against the Hub's copy of shipper/
   audit.py                Hash-chained audit log
   tokens.py               Per-endpoint tokens
 shipper/
   shipper.py              Endpoint telemetry shipper
-  sysmon.py               Reads Sysmon file/process/registry events
+  sysmon.py               Reads Sysmon file/process/registry/DNS/network events
+  winlog.py               Reads Defender, service, task, login and account events
   sysmon-config.xml       Sysmon config: only what the rules need
   enforcer.py             Verifies signed orders, applies firewall blocks and quarantine
   install-endpoint.ps1    One-command Windows installer

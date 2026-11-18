@@ -79,6 +79,7 @@ services:
       - abusech_auth_key
     volumes:
       - warden_data:/var/lib/soc   # enrolled passkeys (public keys) + enrollment code hash
+      - ./shipper:/app/shipper_release:ro   # agent self-check: what endpoints should be running
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777

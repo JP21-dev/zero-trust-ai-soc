@@ -67,6 +67,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from app import dashboard_auth, dashboard_ui, passkeys, testlab, tokens, warden_ui
 from app.activity import Activity
+from app.agentcheck import AgentReleases
 from app.audit import AuditLog
 from app.intel import Intel
 from app.config import get_settings
@@ -75,6 +76,7 @@ settings = get_settings()
 activity = Activity(Path(settings.warden_data_dir) / "activity.jsonl")
 intel = Intel(Path(settings.warden_data_dir))
 audit = AuditLog(Path(settings.warden_data_dir) / "audit.jsonl")
+agents = AgentReleases(Path(settings.agent_release_dir), Path(settings.warden_data_dir))
 activity.audit = audit
 logging.basicConfig(
     level=settings.log_level,
@@ -125,8 +127,16 @@ class TelemetryEvent(BaseModel):
     #   registry  an auto-start key was set (12-14)    lsass     something opened LSASS (10)
     #   injection code injected into another process (8)
     #   driver    a driver loaded (6)                  tamper    process image tampering (25)
+    #   dns       a domain lookup (22)
+    # or a Windows event log entry (shipper/winlog.py):
+    #   defender  Defender turned off / exclusion added / detection (rule = what happened)
+    #   service   a new service was installed (System 7045)
+    #   task      a new scheduled task (Security 4698)
+    #   logon     failed logins, counted on the endpoint (Security 4625; count = last 10 min)
+    #   account   a local account created or added to Administrators (4720 / 4732)
     event_type: Literal["connection", "process", "file", "registry", "lsass", "injection",
-                        "driver", "tamper"] = "connection"
+                        "driver", "tamper", "dns", "defender", "service", "task", "logon",
+                        "account"] = "connection"
     process_name: str = Field(min_length=1, max_length=260)
     pid: int | None = Field(default=None, ge=0)
     exe_path: str | None = Field(default=None, max_length=1024)
@@ -146,7 +156,16 @@ class TelemetryEvent(BaseModel):
     granted_access: str | None = Field(default=None, max_length=32)
     signed: bool | None = None
     signer: str | None = Field(default=None, max_length=256)
-    rule: str | None = Field(default=None, max_length=128)             # Sysmon RuleName
+    rule: str | None = Field(default=None, max_length=128)             # Sysmon RuleName / event kind
+    domain: str | None = Field(default=None, max_length=255)           # dns: the name looked up
+    count: int | None = Field(default=None, ge=0, le=1_000_000)        # logon: failures in the window
+    object_name: str | None = Field(default=None, max_length=512)      # service/task/account/threat name
+    detail: str | None = Field(default=None, max_length=1024)          # extra context, shown as text
+
+    @field_validator("domain")
+    @classmethod
+    def _lower_domain(cls, v: str | None) -> str | None:
+        return v.strip().lower().rstrip(".") if v else v
 
     @field_validator("sha256")
     @classmethod
@@ -196,7 +215,8 @@ SAFE_PROCESSES: dict[str, tuple[str, ...]] = {
 }
 
 TEXT_FIELDS = ("process_name", "exe_path", "user", "cmdline", "parent_name", "parent_path",
-               "parent_cmdline", "file_path", "reg_key", "reg_value", "target_process", "signer", "rule")
+               "parent_cmdline", "file_path", "reg_key", "reg_value", "target_process", "signer", "rule",
+               "domain", "object_name", "detail")
 REDACTION = "[REDACTED:prompt-injection]"
 
 _ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u200e\u200f\u2060\ufeff\u00ad"), None)
@@ -375,7 +395,8 @@ NOVELTY_DISTANCE = 1.0   # L2 distance (not squared) at which anomaly_score hits
 SEEN_EPSILON = 1e-6
 
 
-NON_CONNECTION_FP = ("run:", "file:", "reg:", "lsass:", "inject:", "driver:", "tamper:")
+NON_CONNECTION_FP = ("run:", "file:", "reg:", "lsass:", "inject:", "driver:", "tamper:", "dns:", "defender:",
+                     "svc:", "task:", "logon:", "acct:")
 
 
 def fingerprint(endpoint_id: str, event: dict[str, Any]) -> str | None:
@@ -400,6 +421,19 @@ def fingerprint(endpoint_id: str, event: dict[str, Any]) -> str | None:
         return f"{endpoint_id}|reg:{(event.get('reg_key') or '').lower()}={(event.get('reg_value') or '')[:120].lower()}"
     if et == "injection":
         return f"{endpoint_id}|inject:{name}->{_basename(event.get('target_process') or '?')}"
+    if et == "dns":
+        return f"{endpoint_id}|dns:{name}->{event.get('domain') or '?'}"
+    if et == "defender":
+        return f"{endpoint_id}|defender:{event.get('rule') or '?'}:{(event.get('object_name') or '')[:120].lower()}"
+    if et in ("service", "task"):
+        return (f"{endpoint_id}|{'svc' if et == 'service' else 'task'}:{(event.get('object_name') or '?').lower()}"
+                f"={(event.get('exe_path') or name).lower()}#{sha}")
+    if et == "logon":
+        n = event.get("count") or 0
+        bucket = "100+" if n >= 100 else "25+" if n >= 25 else "10+" if n >= 10 else "3+"
+        return f"{endpoint_id}|logon:{event.get('dst_ip') or 'local'}:{bucket}"
+    if et == "account":
+        return f"{endpoint_id}|acct:{event.get('rule') or '?'}:{(event.get('object_name') or '?').lower()}"
     return f"{endpoint_id}|{et}:{name}"
 
 
@@ -572,6 +606,12 @@ BEHAVIOR_POINTS = {
     "obfuscated_command": 45, "raw_ip_download": 20, "office_child": 45, "double_extension": 35,
     "startup_persistence": 40, "dropped_runnable": 15, "credential_theft": 70, "code_injection": 50,
     "unsigned_driver": 50, "process_tamper": 50,
+    "malicious_domain": 90, "known_c2": 90, "c2_host": 50,
+    "defender_disabled": 80, "defender_exclusion": 65, "defender_tamper": 65, "defender_detection": 45,
+    "defender_severe": 25, "defender_unresolved": 80,
+    "script_service": 45, "script_task": 20,
+    "failed_logins": 20, "password_guessing": 70,
+    "account_created": 45, "admin_added": 70, "rdp_user_added": 45,
 }
 BEHAVIOR_LABELS = {
     "known_malware": "matches a known-malware fingerprint",
@@ -588,12 +628,31 @@ BEHAVIOR_LABELS = {
     "code_injection": "injected code into another process",
     "unsigned_driver": "loaded an unsigned driver",
     "process_tamper": "tampered with a running process's image",
+    "malicious_domain": "looked up a known malware/phishing domain",
+    "known_c2": "connected to a known command-and-control server",
+    "c2_host": "talked to an address known for command-and-control",
+    "defender_disabled": "Microsoft Defender protection was turned off",
+    "defender_exclusion": "an exclusion was added to Microsoft Defender",
+    "defender_tamper": "something tried to change Defender's protection (blocked)",
+    "defender_detection": "Microsoft Defender detected a threat",
+    "defender_severe": "the detection is high or severe",
+    "defender_unresolved": "Defender could not remove a threat",
+    "script_service": "a new service runs a script host or admin tool",
+    "script_task": "a new scheduled task runs a script host or admin tool",
+    "failed_logins": "several failed logins",
+    "password_guessing": "many failed logins: password guessing",
+    "account_created": "a new local account was created",
+    "admin_added": "an account was added to Administrators",
+    "rdp_user_added": "an account was added to Remote Desktop Users",
 }
+SCRIPT_SERVICE_HOSTS = {"cmd.exe", "powershell.exe", "pwsh.exe", "mshta.exe", "wscript.exe", "cscript.exe",
+                        "rundll32.exe", "regsvr32.exe", "certutil.exe", "bitsadmin.exe"}
+DEFENDER_DISABLE_KINDS = {"realtime_off", "protection_off", "tamper_protection_off"}
 
 
 def _subject_path(e: dict[str, Any]) -> str:
     """The file a finding is about: the dropped/loaded file, or the program itself."""
-    if e.get("event_type") in ("file", "driver"):
+    if e.get("event_type") in ("file", "driver", "defender"):
         return (e.get("file_path") or "").replace("/", "\\")
     return (e.get("exe_path") or "").replace("/", "\\")
 
@@ -609,14 +668,25 @@ def behavior_findings(endpoint_id: str, events: list[dict[str, Any]]) -> list[di
         flags: dict[str, str] = {}
         if (hit := intel.lookup(e.get("sha256"))):
             flags["known_malware"] = f"{hit['label']} ({hit['source']})"
-        if path and SUSPICIOUS_DIR.search(path):
+        # A Defender detection's path isn't new evidence by itself. Excluded folders have
+        # no trailing backslash, so one is added before matching.
+        if path and SUSPICIOUS_DIR.search(path + "\\" if et == "defender" else path) \
+                and not (et == "defender" and e.get("rule") != "exclusion_added"):
             flags["suspicious_location"] = path[:160]
+        if et in ("service", "task") and not flags.get("suspicious_location") and SUSPICIOUS_DIR.search(cmd):
+            flags["suspicious_location"] = SUSPICIOUS_DIR.search(cmd).group(0).strip("\\")[:160] + " (in its command)"
+        if et in ("connection", "dns") and e.get("dst_ip"):
+            if (hit := intel.lookup_ip(e["dst_ip"], e.get("dst_port") if et == "connection" else None)):
+                where = f"{e['dst_ip']}:{e['dst_port']}" if hit["exact"] else e["dst_ip"]
+                flags["known_c2" if hit["exact"] else "c2_host"] = f"{where}: {hit['label']} ({hit['source']})"
+        if et == "dns" and (hit := intel.lookup_domain(e.get("domain"))):
+            flags["malicious_domain"] = f"{e.get('domain')}: {hit['label']} ({hit['source']})"
         if et == "connection":
             if e.get("dst_port") in ATTACKER_PORTS:
                 flags["attacker_port"] = f"port {e['dst_port']}"
             if name in LOLBINS and e.get("dst_ip"):
                 flags["lolbin_network"] = name
-        if et in ("connection", "process"):
+        if et in ("connection", "process", "service", "task"):
             obf = [label for label, p in OBFUSCATION if p.search(cmd)]
             if obf:
                 flags["obfuscated_command"] = ", ".join(obf)
@@ -644,6 +714,35 @@ def behavior_findings(endpoint_id: str, events: list[dict[str, Any]]) -> list[di
             flags["unsigned_driver"] = _basename(path) or name
         if et == "tamper":
             flags["process_tamper"] = name
+        if et in ("service", "task"):
+            kind = "service" if et == "service" else "scheduled task"
+            flags["startup_persistence"] = f"new {kind} {e.get('object_name') or '?'}"[:160]
+            if name in SCRIPT_SERVICE_HOSTS:
+                flags["script_service" if et == "service" else "script_task"] = f"{e.get('object_name') or '?'} → {name}"[:160]
+        if et == "defender":
+            kind, what = e.get("rule") or "", (e.get("object_name") or e.get("detail") or "")[:160]
+            if kind in DEFENDER_DISABLE_KINDS:
+                flags["defender_disabled"] = what or kind
+            elif kind == "exclusion_added":
+                flags["defender_exclusion"] = what
+            elif kind == "tamper_blocked":
+                flags["defender_tamper"] = what or "blocked change"
+            elif kind == "detection":
+                flags["defender_detection"] = what or "threat"
+                if re.search(r"\b(severe|high)\b", e.get("detail") or "", re.I):
+                    flags["defender_severe"] = (e.get("detail") or "")[:80]
+            elif kind == "action_failed":
+                flags["defender_unresolved"] = what or "threat"
+        if et == "logon":
+            n = e.get("count") or 0
+            who = f"{n} in 10 min" + (f" from {e['dst_ip']}" if e.get("dst_ip") else "") + \
+                  (f" (accounts: {e.get('object_name')})" if e.get("object_name") else "")
+            if n >= 10:
+                flags["password_guessing"] = who[:160]
+            elif n >= 3:
+                flags["failed_logins"] = who[:160]
+        if et == "account" and e.get("rule") in ("account_created", "admin_added", "rdp_user_added"):
+            flags[e["rule"]] = (f"{e.get('object_name') or '?'}" + (f" by {e['user']}" if e.get("user") else ""))[:160]
         if flags:
             out.append({"event_index": idx, "event_type": et, "process": name, "dst_ip": e.get("dst_ip"),
                         "dst_port": e.get("dst_port"), "path": path or None, "sha256": e.get("sha256"),
@@ -1414,6 +1513,9 @@ async def _intel_loop() -> None:
             await intel.refresh(rt.http, settings.abusech_auth_key)
         else:
             intel._load_custom()   # pick up edits to the custom list
+        if settings.intel_feed_enabled and (intel.tf_update is None or time.time() - intel.tf_update > 20 * 3600):
+            await intel.refresh_threatfox(rt.http, settings.abusech_auth_key)
+        agents.current()   # remember the Hub's current agent version
         await asyncio.sleep(3600)
 
 
@@ -1528,7 +1630,7 @@ async def require_shipper_token(x_soc_token: str | None = Header(default=None)) 
 # ---- rate limits: a compromised or buggy endpoint can't flood the Hub ----
 _BUCKETS: dict[str, list[float]] = {}   # key -> [tokens, last_refill]
 RATE_LIMITS = {   # route: (per-minute rate, burst). Normal shippers use a fraction of these.
-    "ingest": (30, 30), "orders": (30, 20), "ack": (30, 20), "presence": (6, 4),
+    "ingest": (30, 30), "orders": (30, 20), "ack": (30, 20), "presence": (6, 4), "integrity": (6, 4),
 }
 
 
@@ -1796,6 +1898,57 @@ async def presence_report(rep: PresenceReport, ident: ShipperIdentity = Depends(
                          "reported_at": now} for p in rep.peers}
     PRESENCE_REPORTED_AT = now
     return {"ok": True, "peers": len(PRESENCE)}
+
+
+# ---- agent self-check (see agentcheck.py) ----
+INTEGRITY: dict[str, dict[str, Any]] = {}   # endpoint -> last check result
+
+
+class IntegrityReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    endpoint_id: str = Field(pattern=r"^[A-Za-z0-9._-]{1,64}$")
+    files: dict[Annotated[str, Field(pattern=r"^[A-Za-z0-9._-]{1,64}$")],
+                Annotated[str, Field(pattern=r"^[0-9a-fA-F]{64}$")] | None] = Field(max_length=32)
+
+
+@app.post("/integrity")
+async def integrity_report(rep: IntegrityReport, ident: ShipperIdentity = Depends(require_shipper)) -> dict:
+    """Each shipper's fingerprint of its own code. Alerts on a version the Hub never shipped."""
+    ident.check(rep.endpoint_id)
+    ep = rep.endpoint_id.lower()
+    rate_limit("integrity", ep)
+    result = agents.classify(rep.files)
+    prev = INTEGRITY.get(ep) or {}
+    manifest = hashlib.sha256(json.dumps(rep.files, sort_keys=True).encode()).hexdigest()
+    entry = {**result, "checked_at": time.time(), "manifest": manifest,
+             "alerted": prev.get("alerted") if result["state"] == "modified" else None}
+    INTEGRITY[ep] = entry
+    if result["state"] == "modified" and prev.get("alerted") != manifest:
+        entry["alerted"] = manifest
+        bad = [f"{n} ({st})" for n, st in result["files"].items() if st in ("modified", "missing")]
+        activity.record("agent_modified", endpoint_id=ep, files=bad)
+        log.warning("integrity: %s is running agent code the Hub never shipped: %s", ep, ", ".join(bad))
+        await _post_discord({"embeds": [{
+            "title": f"🚨 {ep}: the SOC agent's code was changed",
+            "color": 0xDC2626,
+            "description": ("These files don't match any version this Hub has ever had: "
+                            + ", ".join(f"`{_safe_md(b, 80)}`" for b in bad)
+                            + ".\nIf you didn't edit them, someone with admin rights on that machine did. "
+                              "Re-run the installer from the Hub's copy to restore them."),
+        }]}, "agent modified alert")
+    elif prev.get("state") == "modified" and result["state"] != "modified":
+        activity.record("agent_restored", endpoint_id=ep, state=result["state"])
+        await _post_discord({"embeds": [{
+            "title": f"✅ {ep}: the SOC agent's code is back to a known version",
+            "color": 0x16A34A,
+            "description": "Its files match " + ("the Hub's copy." if result["state"] == "ok" else "a version the Hub shipped before."),
+        }]}, "agent restored notice")
+    return {"ok": True, "state": result["state"]}
+
+
+def _integrity_view() -> dict[str, Any]:
+    return {ep: {"state": v["state"], "files": v["files"], "checked_at": v["checked_at"]}
+            for ep, v in INTEGRITY.items()}
 
 
 def _presence_fresh(now: float) -> bool:
@@ -2267,8 +2420,11 @@ async def _run_scenario(sc: testlab.Scenario) -> testlab.TestRun:
             _live(run.id, "attack", batch=i, of=len(batches), events=[{
                 "type": e.get("event_type") or "connection",
                 "process": e["process_name"], "path": e.get("exe_path"), "user": e.get("user"),
-                "dst": (f"{e.get('dst_ip')}:{e.get('dst_port')}" if e.get("dst_ip") else
-                        e.get("file_path") or e.get("reg_key") or e.get("target_process")
+                "dst": (e.get("domain") if e.get("event_type") == "dns" else
+                        f"{e.get('count')} failed logins" + (f" from {e['dst_ip']}" if e.get("dst_ip") else "")
+                        if e.get("event_type") == "logon" else
+                        f"{e.get('dst_ip')}:{e.get('dst_port')}" if e.get("dst_ip") else
+                        e.get("object_name") or e.get("file_path") or e.get("reg_key") or e.get("target_process")
                         or (f"started by {e.get('parent_name')}" if e.get("parent_name") else "")),
                 "sha256": e.get("sha256"), "cmdline": (e.get("cmdline") or "")[:200]}
                 for e in raw])
@@ -2436,6 +2592,7 @@ async def dashboard_summary(session: dict = Depends(require_dashboard)) -> Respo
         "discord_last": rt.discord_last,
         "watch": _watch_view(now),
         "intel": intel.status(),
+        "integrity": _integrity_view(),
         "audit": audit.status(),
         "token_kind": dict(TOKEN_KIND),
         "strict_tokens": settings.strict_endpoint_tokens,

@@ -807,7 +807,8 @@ function renderDevices(d) {
     const tn = w.tailnet ? " · Tailscale: " + (w.tailnet.online ? "online" : "offline") + (w.tailnet.name ? " as " + w.tailnet.name : "") : "";
     cards.push(device("💻", e.endpoint_id, ["Endpoint", "Telemetry shipper", "Firewall enforcer"], st, doing,
       num(e.events) + " connections reported · " + plural(e.escalations, "alert") + " · " + plural(e.blocks, "block") + tn
-      + (d.token_kind[e.endpoint_id] === "shared" ? " · ⚠ uses the old shared token" : d.token_kind[e.endpoint_id] ? " · own token" : "")));
+      + (d.token_kind[e.endpoint_id] === "shared" ? " · ⚠ uses the old shared token" : d.token_kind[e.endpoint_id] ? " · own token" : "")
+      + agentState((d.integrity || {})[e.endpoint_id])));
   }
   for (const u of d.watch.unprotected || []) {
     cards.push(device(u.os.toLowerCase() === "windows" ? "💻" : "🖥️", u.name || u.host, ["On your tailnet", "Not protected"],
@@ -1083,8 +1084,15 @@ const KINDS = {
     ? `${e.endpoint_id}'s agent went silent while the machine is online` + (e.is_hub ? " (the Hub itself)" : "") + ` (quiet ${Math.round(e.quiet_seconds / 60)} min)`
     : `${e.endpoint_id} stopped checking in (no Tailscale data to tell if it's asleep)`],
   audit_broken: ["🚨", (e) => `Audit log failed verification at entry ${e.broken_at} of ${e.entries}: history was modified`],
+  agent_modified: ["🚨", (e) => `${e.endpoint_id}: the SOC agent's code was changed (${(e.files || []).join(", ")})`],
+  agent_restored: ["✅", (e) => `${e.endpoint_id}: the SOC agent's code is back to a known version`],
   endpoint_back: ["✅", (e) => `${e.endpoint_id} is checking in again after ${Math.max(1, Math.round(e.quiet_seconds / 60))} min`],
 };
+function agentState(i) {
+  if (!i) return " · agent code: not reported yet";
+  return " · agent code: " + ({ ok: "verified", outdated: "outdated (re-run the installer)",
+    modified: "⚠ CHANGED, doesn't match any version the Hub shipped", unverifiable: "can't check (no Hub copy)" }[i.state] || i.state);
+}
 function renderTimeline(d) {
   const items = d.timeline.filter((e) => KINDS[e.kind]);
   if (!items.length) { $("timeline").replaceChildren(el("li", { class: "empty-note", text: "No events yet." })); return; }
@@ -1120,6 +1128,10 @@ function renderSystem(d) {
     ["Threat intel", (d.intel.feed ? num(d.intel.feed) + " MalwareBazaar" : "No MalwareBazaar") + " + " + num(d.intel.custom)
       + " custom fingerprints + EICAR" + (d.intel.updated_at ? " · updated " + ago(d.intel.updated_at, d.now) : "")
       + (d.intel.last_error ? " · MalwareBazaar: " + d.intel.last_error : "")],
+    ["Domain & C2 intel", d.intel.domains || d.intel.c2
+      ? num(d.intel.domains) + " malware domains + " + num(d.intel.c2) + " C2 addresses (ThreatFox)"
+        + (d.intel.tf_updated_at ? " · updated " + ago(d.intel.tf_updated_at, d.now) : "")
+      : "Built-in test domain only" + (d.intel.tf_error ? " · ThreatFox: " + d.intel.tf_error : "")],
     ["Audit log", d.audit.verified ? num(d.audit.entries) + " entries · hash chain verified · head " + d.audit.head.slice(0, 12) + "…"
       : "⚠ BROKEN at entry " + d.audit.broken_at + " of " + d.audit.entries + ": history was modified"],
     ["Endpoint tokens", d.strict_tokens ? "Per-endpoint only (shared token refused)" : "Per-endpoint preferred; shared token still accepted"],

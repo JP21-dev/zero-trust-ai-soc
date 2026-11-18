@@ -34,6 +34,15 @@ Configuration: environment variables, falling back to <SOC_STATE_DIR>/config.jso
                       injection and spoofing checks, but can contain secrets.
   SOC_LOG_LEVEL       default INFO
 
+Windows event logs (see sysmon.py and winlog.py), every ~20 s:
+  SOC_SYSMON          1 (default) or 0. Sysmon process/file/registry/DNS/... events.
+  SOC_WINLOG          1 (default) or 0. Defender, new services and tasks, failed
+                      logins, new accounts and admins, from Windows' own logs.
+
+Agent self-check: every ~10 min (and at start) the shipper reports the SHA-256 of
+its own files to the Hub (POST /integrity), which alerts if they don't match any
+version it shipped.
+
 Enforcement (see enforcer.py): each cycle the shipper also asks the Hub for
 approved execution orders, verifies their Ed25519 signature against the pinned
 Hub key, and applies them as Windows Firewall rules.
@@ -59,6 +68,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import ipaddress
 import json
 import logging
@@ -113,6 +123,8 @@ REPORT_PRESENCE = (os.environ.get("SOC_REPORT_PRESENCE") or str(_CFG.get("report
 TAILSCALE_CLI = (os.environ.get("SOC_TAILSCALE_CLI") or _CFG.get("tailscale_cli")
                  or (r"C:\Program Files\Tailscale\tailscale.exe" if IS_WINDOWS else "tailscale"))
 PRESENCE_EVERY = 6          # cycles (~60 s)
+INTEGRITY_EVERY = 60        # cycles (~10 min)
+AGENT_FILES = ("shipper.py", "enforcer.py", "sysmon.py", "winlog.py", "sysmon-config.xml")
 TOKEN_FILE = os.environ.get("SOC_TOKEN_FILE", DEFAULT_TOKEN_FILE)
 INTERVAL = max(1.0, float(os.environ.get("SOC_INTERVAL", "10")))
 INCLUDE_CMDLINE = os.environ.get("SOC_INCLUDE_CMDLINE", "1") != "0"
@@ -437,6 +449,34 @@ def report_presence(token: str) -> None:
         log.warning("presence: can't reach the Hub: %s", type(exc).__name__)
 
 
+def agent_manifest() -> dict:
+    """SHA-256 of this agent's own files (None = the file is gone)."""
+    here = Path(__file__).resolve().parent
+    out: dict = {}
+    for name in AGENT_FILES:
+        try:
+            out[name] = hashlib.sha256((here / name).read_bytes()).hexdigest()
+        except OSError:
+            out[name] = None
+    return out
+
+
+def report_integrity(token: str) -> None:
+    body = json.dumps({"endpoint_id": ENDPOINT_ID, "files": agent_manifest()}).encode()
+    req = urllib.request.Request(hub_base_url() + "/integrity", data=body, method="POST",
+                                 headers={"Content-Type": "application/json", "X-SOC-Token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            state = json.loads(resp.read() or b"{}").get("state")
+        if state not in ("ok", None):
+            log.warning("self-check: the Hub says this agent's code is %s", state)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:   # 404: an older Hub without the self-check
+            log.warning("self-check: Hub answered HTTP %d", exc.code)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        log.warning("self-check: can't reach the Hub: %s", type(exc).__name__)
+
+
 def run(dry_run: bool) -> None:
     check_hub_url()
     sampler = Sampler()
@@ -454,7 +494,13 @@ def run(dry_run: bool) -> None:
                 sysmon_state = "readable"
             except Exception:
                 sysmon_state = "unreadable"
-        print(f"# {len(events)} events, tailscale_up={tailscale_is_up()}, sysmon={sysmon_state}", file=sys.stderr)
+        winlog_state = "off"
+        if IS_WINDOWS and os.environ.get("SOC_WINLOG", "1") != "0":
+            from winlog import WinLogReader
+            st = WinLogReader(STATE_DIR).status()
+            winlog_state = ",".join(f"{k}:{v}" for k, v in st.items())
+        print(f"# {len(events)} events, tailscale_up={tailscale_is_up()}, sysmon={sysmon_state}, "
+              f"winlog={winlog_state}", file=sys.stderr)
         return
 
     token = _read_token()
@@ -464,6 +510,10 @@ def run(dry_run: bool) -> None:
     if IS_WINDOWS and os.environ.get("SOC_SYSMON", "1") != "0":
         from sysmon import SysmonReader
         reader = SysmonReader(STATE_DIR, include_cmdline=INCLUDE_CMDLINE)
+    logs = None
+    if IS_WINDOWS and os.environ.get("SOC_WINLOG", "1") != "0":
+        from winlog import WinLogReader
+        logs = WinLogReader(STATE_DIR, include_cmdline=INCLUDE_CMDLINE)
     lower_priority()
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
@@ -481,6 +531,11 @@ def run(dry_run: bool) -> None:
         events = sampler.sample()
         if reader is not None and cycle % 2 == 0:   # Sysmon every ~20 s
             events += reader.read()
+        if logs is not None and cycle % 2 == 1:     # Windows logs every ~20 s, in between
+            try:
+                events += logs.read()
+            except Exception:   # never let log reading kill telemetry
+                log.exception("winlog read crashed")
         if events:
             sender.enqueue(events)
         sender.flush()
@@ -489,6 +544,11 @@ def run(dry_run: bool) -> None:
                 enf.poll()
             except Exception:   # never let enforcement kill telemetry
                 log.exception("enforcer poll crashed")
+        if cycle % INTEGRITY_EVERY == 0 and tailscale_is_up():
+            try:
+                report_integrity(token)
+            except Exception:
+                log.exception("self-check report crashed")
         if REPORT_PRESENCE and cycle % PRESENCE_EVERY == 0 and tailscale_is_up():
             try:
                 report_presence(token)

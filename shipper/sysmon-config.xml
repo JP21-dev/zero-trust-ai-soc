@@ -17,12 +17,40 @@
       <ProcessCreate onmatch="exclude" />
     </RuleGroup>
 
-    <!-- 3 / 22: network and DNS are covered by the shipper itself; keep them off. -->
+    <!-- 3: connections, only from risky places, Windows admin tools, or to attacker
+         ports. The shipper samples every connection every 10 s; this catches the
+         short ones in between without logging every browser tab. -->
     <RuleGroup name="" groupRelation="or">
-      <NetworkConnect onmatch="include" />
+      <NetworkConnect onmatch="include">
+        <Image condition="contains">\AppData\Local\Temp\</Image>
+        <Image condition="contains">\Windows\Temp\</Image>
+        <Image condition="contains">\Downloads\</Image>
+        <Image condition="contains">\Users\Public\</Image>
+        <Image condition="contains">$Recycle.Bin</Image>
+        <Image condition="end with">\powershell.exe</Image>
+        <Image condition="end with">\pwsh.exe</Image>
+        <Image condition="end with">\cmd.exe</Image>
+        <Image condition="end with">\mshta.exe</Image>
+        <Image condition="end with">\rundll32.exe</Image>
+        <Image condition="end with">\regsvr32.exe</Image>
+        <Image condition="end with">\certutil.exe</Image>
+        <Image condition="end with">\bitsadmin.exe</Image>
+        <Image condition="end with">\wscript.exe</Image>
+        <Image condition="end with">\cscript.exe</Image>
+        <Image condition="end with">\msbuild.exe</Image>
+        <Image condition="end with">\installutil.exe</Image>
+        <Image condition="end with">\regasm.exe</Image>
+        <Image condition="end with">\regsvcs.exe</Image>
+        <Image condition="end with">\hh.exe</Image>
+        <DestinationPort condition="is any">1234;1337;2222;3333;4444;4445;5555;6666;6667;6697;7777;9001;9030;9050;9051;12345;14444;31337;45700;50050;54321</DestinationPort>
+      </NetworkConnect>
     </RuleGroup>
+
+    <!-- 22: every DNS lookup, with the program that made it. The shipper drops local
+         names and sends each program+domain once per 6 hours; the Hub checks them
+         against threat intel. -->
     <RuleGroup name="" groupRelation="or">
-      <DnsQuery onmatch="include" />
+      <DnsQuery onmatch="exclude" />
     </RuleGroup>
 
     <!-- 11: files created where malware lands, and anything in a Startup folder. -->

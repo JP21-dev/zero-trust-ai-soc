@@ -13,6 +13,9 @@ Windows' own `wevtutil` (no extra Python packages) and maps them to Hub events:
   Sysmon 8   remote thread created   -> "injection"
   Sysmon 6   driver loaded           -> "driver"    (only unsigned/invalid ones)
   Sysmon 25  process tampering       -> "tamper"
+  Sysmon 3   network connection      -> "connection" (config: risky programs/ports only; catches
+                                        connections shorter than the shipper's 10 s sampling)
+  Sysmon 22  DNS lookup              -> "dns"       (each program+domain once per 6 hours)
 
 To keep the Hub's view meaningful and the traffic small, routine noise is dropped
 here: launches of programs installed under C:\\Windows or Program Files (unless
@@ -23,6 +26,7 @@ same launch within 15 minutes.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -41,6 +45,11 @@ NS = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
 MAX_PER_READ = 2000
 MAX_HASH_BYTES = 64 * 2**20
 DEDUP_SECONDS = 900
+DNS_DEDUP_SECONDS = 6 * 3600
+MAX_DNS_PER_READ = 400
+LOCAL_SUFFIXES = (".local", ".lan", ".home", ".arpa", ".ts.net", ".localdomain", ".internal", ".localhost",
+                  ".home.arpa", ".mshome.net")
+_IPV4 = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])")
 
 SYSTEM_ROOTS = ("c:\\windows\\", "c:\\program files\\", "c:\\program files (x86)\\")
 TRUSTED_LSASS_READERS = ("c:\\windows\\", "c:\\programdata\\microsoft\\windows defender\\",
@@ -56,7 +65,8 @@ OFFICE_APPS = {"winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "oneno
 RUNNABLE = re.compile(r"\.(exe|dll|scr|com|pif|msi|msp|ps1|psm1|vbs|vbe|js|jse|wsf|hta|bat|cmd|lnk|jar|cpl|iso|img)$", re.I)
 LIMITS = {"process_name": 260, "exe_path": 1024, "user": 256, "cmdline": 4096, "parent_name": 260,
           "parent_path": 1024, "parent_cmdline": 4096, "file_path": 1024, "reg_key": 1024,
-          "reg_value": 2048, "target_process": 1024, "signer": 256, "rule": 128, "granted_access": 32}
+          "reg_value": 2048, "target_process": 1024, "signer": 256, "rule": 128, "granted_access": 32,
+          "domain": 255, "detail": 1024}
 
 
 def _base(path: str | None) -> str:
@@ -79,6 +89,16 @@ def _iso(utc: str | None) -> str:
             .isoformat().replace("+00:00", "Z")
     except ValueError:
         return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _public_ip(text: str | None) -> str | None:
+    try:
+        addr = ipaddress.ip_address((text or "").split("%", 1)[0])
+    except ValueError:
+        return None
+    if addr.is_loopback or addr.is_unspecified or addr.is_link_local or addr.is_multicast:
+        return None
+    return str(addr)
 
 
 def parse_events(xml_text: str) -> list[tuple[int, int, dict[str, str]]]:
@@ -105,6 +125,8 @@ class SysmonReader:
         self.run = runner or self._wevtutil
         self.last_id: int | None = None
         self.seen: dict[str, float] = {}
+        self.dns_seen: dict[str, float] = {}
+        self.dns_this_read = 0
         self.hash_cache: dict[tuple, str | None] = {}
         self.available: bool | None = None
         try:
@@ -152,6 +174,7 @@ class SysmonReader:
             log.warning("sysmon: unparsable batch skipped: %s", exc)
             return []
         events = []
+        self.dns_this_read = 0
         for rid, eid, data in records:
             self.last_id = max(self.last_id, rid)
             try:
@@ -165,6 +188,10 @@ class SysmonReader:
             self._save()
         now = time.time()
         self.seen = {k: t for k, t in self.seen.items() if now - t < DEDUP_SECONDS}
+        if len(self.dns_seen) > 20000 or self.dns_this_read:
+            self.dns_seen = {k: t for k, t in self.dns_seen.items() if now - t < DNS_DEDUP_SECONDS}
+        if self.dns_this_read > MAX_DNS_PER_READ:
+            log.warning("sysmon: %d new DNS lookups in one read; sent the first %d", self.dns_this_read, MAX_DNS_PER_READ)
         return events
 
     # ---------------------------------------------------------------- mapping
@@ -270,6 +297,42 @@ class SysmonReader:
             return {**base, "event_type": "driver", "process_name": _base(img) or "driver", "exe_path": img,
                     "file_path": img, "sha256": _sha_from(d.get("Hashes")), "signed": False,
                     "signer": d.get("Signature")}
+        if eid == 3:   # network connection (config: risky programs and attacker ports only)
+            if d.get("Initiated", "").lower() != "true":
+                return None
+            ip = _public_ip(d.get("DestinationIp"))
+            port = d.get("DestinationPort", "")
+            if not ip or not port.isdigit():
+                return None
+            image = d.get("Image", "")
+            if self._dup(f"n|{image.lower()}|{ip}|{port}"):
+                return None
+            proto = (d.get("Protocol") or "").lower()
+            return {**base, "event_type": "connection", "process_name": _base(image) or "unknown", "exe_path": image,
+                    "pid": int(d["ProcessId"]) if d.get("ProcessId", "").isdigit() else None,
+                    "user": d.get("User"), "dst_ip": ip, "dst_port": int(port),
+                    "protocol": proto if proto in ("tcp", "udp") else "other",
+                    "sha256": self._hash(image) if image and not _under(image, SYSTEM_ROOTS) else None,
+                    "rule": base["rule"] or "sysmon network"}
+        if eid == 22:   # DNS lookup
+            q = (d.get("QueryName") or "").strip().lower().rstrip(".")
+            if not q or "." not in q or q.endswith(LOCAL_SUFFIXES) or _public_ip(q) or len(q) > 253:
+                return None
+            image = d.get("Image", "")
+            key = f"{image.lower()}|{q}"
+            now = time.time()
+            if now - self.dns_seen.get(key, 0) < DNS_DEDUP_SECONDS:
+                return None
+            self.dns_seen[key] = now
+            self.dns_this_read += 1
+            if self.dns_this_read > MAX_DNS_PER_READ:
+                return None
+            ips = [ip for ip in _IPV4.findall(d.get("QueryResults") or "") if _public_ip(ip)]
+            return {**base, "event_type": "dns", "process_name": _base(image) or "unknown", "exe_path": image or None,
+                    "pid": int(d["ProcessId"]) if d.get("ProcessId", "").isdigit() else None,
+                    "user": d.get("User"), "domain": q, "dst_ip": ips[0] if ips else None,
+                    "detail": ";".join(ips[:8]) or None,
+                    "sha256": self._hash(image) if image and not _under(image, SYSTEM_ROOTS) else None}
         if eid == 25:   # process tampering
             image = d.get("Image", "")
             if self._dup(f"t|{image.lower()}"):
